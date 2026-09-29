@@ -1,6 +1,6 @@
 # Phase 3 Fixture Manifest
 
-Source JPEG: /home/kel/Documents/Ideas/Cardeckatcher/card collection/website/images/deck_100_LM_Filters_USPCC.jpg
+Fixture source JPEG: deck_100_LM_Filters_USPCC.jpg
 Source JPEG bytes: 11503
 Valid fixture ID: deck_100_LM_Filters_USPCC
 

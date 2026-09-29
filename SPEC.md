@@ -13,8 +13,8 @@ CDECK V1 reads and writes:
 
 ## Purpose
 
-CDECK001 is a self-contained, read-oriented container for the
-Cardeckatcher playing-card collection.
+CDECK001 is a self-contained, read-oriented container for
+playing-card collections.
 
 It stores:
 
@@ -150,9 +150,9 @@ No Unicode normalization form is imposed.
 
 ID equality uses the decoded JSON string value.
 
-## Cardeckatcher V1 ID Derivation
+## V1 ID Derivation
 
-For the verified Cardeckatcher source collection:
+For the canonical V1 CSV source model:
 
     id = filename stem of src
 
