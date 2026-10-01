@@ -6,7 +6,7 @@ This document specifies **CDECK File Format 1**.
 
 Software release numbering is independent from file-format generation.
 
-CDECK V1 reads and writes:
+Published CDECK v1 and current V2 development both read and write:
 
     CDECK File Format 1
     magic = "CDECK001"
@@ -84,6 +84,8 @@ Maximum encoded index size:
 
 Canonical writer output must be compact and deterministic.
 
+Reference tooling distinguishes structural validity from canonical encoding. A structurally valid `CDECK001` file may use a different JSON byte representation and still be readable. Canonical verification reconstructs the official semantic index, applies the deterministic writer encoding, and compares the resulting bytes exactly with the stored index.
+
 Readers must not depend on JSON property order.
 
 ## Canonical Deck Record
@@ -150,9 +152,9 @@ No Unicode normalization form is imposed.
 
 ID equality uses the decoded JSON string value.
 
-## V1 ID Derivation
+## Reference CSV ID Derivation
 
-For the canonical V1 CSV source model:
+For the reference CSV source model:
 
     id = filename stem of src
 
@@ -209,6 +211,10 @@ CDECK treats JPEG bytes as opaque payload data.
 CDECK does not decode, transcode, recompress, normalize, or otherwise
 rewrite JPEG internals.
 
+The reference builder resolves each source JPEG path within the CSV source directory before reading it. Paths that resolve outside that directory, including escaping symlinks, are rejected. Symlinks that resolve inside the source directory are permitted.
+
+The reference builder also requires each source JPEG to begin with the JPEG SOI bytes `FF D8`. This is a builder sanity check; accepted JPEG bytes are still copied byte-for-byte without decoding or rewriting them.
+
 ## Complete File Length
 
 If the complete representation length is available, it must equal:
@@ -260,6 +266,12 @@ A byte source conceptually provides:
 
 and returns exactly the requested bytes or fails.
 
+The reference HTTP source additionally accepts an optional abort signal:
+
+    read(start, length, signal?)
+
+Cancellation does not change the exact-read contract.
+
 Reference remote parsing proceeds as:
 
     read(0, 12)
@@ -284,12 +296,21 @@ For `206 Partial Content`:
 
 - body length must equal the requested length;
 - visible `Content-Range` should be validated;
+- numeric complete-size observations must agree with each other;
 - visible complete size must agree with the derived expected file length.
+
+For representation identity:
+
+- the first visible strong ETag locks the reference HTTP source snapshot;
+- later network responses must present the same strong ETag once locked;
+- weak ETags do not establish byte identity;
+- a source without a visible strong ETag remains usable but has no hard snapshot guarantee.
 
 If a Range request receives `200 OK`:
 
 - treat Range as unsupported or ignored;
-- cache the complete response;
+- receive the complete response before installing the cache;
+- record the complete body length as the source size;
 - validate its length after parsing the index;
 - satisfy later exact reads from local slices.
 
@@ -314,6 +335,15 @@ When a deck approaches the viewport:
 Duplicate concurrent retrieval of the same image must be prevented.
 
 Blob URLs must be revoked when no longer needed.
+
+The reference lazy loader also provides:
+
+    onError(error, target, record)
+    retry(target)
+
+`onError` is optional. Retry is explicit; there is no automatic retry, backoff, or request queue. Failed non-abort loads clear their in-flight state before the error callback runs, allowing a later retry to start a fresh request.
+
+Each active lazy load owns an abort controller. `release(target)` aborts an outstanding request and prevents a late result from being installed. `disconnect()` stops observation and aborts all active loads. Expected aborts are cleanup and do not invoke the ordinary error callback.
 
 ## Validation Requirements
 
@@ -342,6 +372,8 @@ Reject at minimum:
 - complete size mismatch when known;
 - short HTTP range response;
 - impossible ranges;
+- changed strong ETag after snapshot identity is locked;
+- conflicting numeric complete-size observations;
 - HTTP or network failure.
 
 Attacker-controlled values must be bounds-checked before they drive

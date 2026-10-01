@@ -1,10 +1,12 @@
-# Phase 3 Fixture Manifest
+# Fixture Manifest
 
 Fixture source JPEG: deck_100_LM_Filters_USPCC.jpg
 Source JPEG bytes: 11503
 Valid fixture ID: deck_100_LM_Filters_USPCC
 
 Expected results:
+
+`vectors.json` contains shared expected fixture results consumed by both the Python and JavaScript test suites.
 
 PASS  valid-one-record.cdeck
 FAIL  wrong-magic.cdeck

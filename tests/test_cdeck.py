@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import io
 import json
 import struct
 import tempfile
@@ -42,6 +44,13 @@ class CDeckVerifierTests(unittest.TestCase):
             writer.writerows(rows)
 
         return root, csv_path
+
+    def run_cli(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = cdeck.main(list(args))
+        return status, stdout.getvalue(), stderr.getvalue()
 
     def assert_invalid(self, name, message):
         with self.assertRaisesRegex(
@@ -395,8 +404,8 @@ class CDeckVerifierTests(unittest.TestCase):
         root, csv_path = self.make_source(
             rows,
             files={
-                "images/deck_001_Alpha.jpg": b"AA",
-                "images/deck_002_Beta.jpg": b"BBB",
+                "images/deck_001_Alpha.jpg": b"\xff\xd8",
+                "images/deck_002_Beta.jpg": b"\xff\xd8B",
             },
         )
 
@@ -453,7 +462,7 @@ class CDeckVerifierTests(unittest.TestCase):
 
         self.assertEqual(
             data[payload_start:],
-            b"BBBAA",
+            b"\xff\xd8B\xff\xd8",
         )
 
     def test_build_rejects_unexpected_source_field(self):
@@ -531,8 +540,8 @@ class CDeckVerifierTests(unittest.TestCase):
         root, csv_path = self.make_source(
             rows,
             files={
-                "images/deck_same.jpg": b"A",
-                "other/deck_same.jpg": b"B",
+                "images/deck_same.jpg": b"\xff\xd8",
+                "other/deck_same.jpg": b"\xff\xd8",
             },
         )
 
@@ -569,6 +578,87 @@ class CDeckVerifierTests(unittest.TestCase):
 
 
 
+    def test_build_rejects_symlink_escape(self):
+        rows = [
+            {
+                "src": "images/escape.jpg",
+                "name": "Escape",
+                "quantity": "1",
+                "brand": "",
+                "printer": "",
+            }
+        ]
+        root, csv_path = self.make_source(rows)
+        outside = self.write_bytes(b"\xff\xd8X")
+        link = root / "images" / "escape.jpg"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+
+        with self.assertRaisesRegex(
+            cdeck.CDeckError,
+            "unsafe src path",
+        ):
+            cdeck.build_collection(
+                csv_path,
+                root / "output.cdeck",
+            )
+
+    def test_build_allows_internal_symlink_and_preserves_bytes(self):
+        payload = b"\xff\xd8JPEG-BYTES"
+        rows = [
+            {
+                "src": "images/link.jpg",
+                "name": "Internal",
+                "quantity": "1",
+                "brand": "",
+                "printer": "",
+            }
+        ]
+        root, csv_path = self.make_source(
+            rows,
+            files={
+                "images/real.jpg": payload,
+            },
+        )
+        (root / "images" / "link.jpg").symlink_to("real.jpg")
+        archive = root / "output.cdeck"
+
+        result = cdeck.build_collection(
+            csv_path,
+            archive,
+        )
+
+        self.assertEqual(
+            archive.read_bytes()[result["payloadStart"]:],
+            payload,
+        )
+
+    def test_build_rejects_non_jpeg_soi(self):
+        rows = [
+            {
+                "src": "images/not-jpeg.jpg",
+                "name": "Not JPEG",
+                "quantity": "1",
+                "brand": "",
+                "printer": "",
+            }
+        ]
+        root, csv_path = self.make_source(
+            rows,
+            files={
+                "images/not-jpeg.jpg": b"NO",
+            },
+        )
+
+        with self.assertRaisesRegex(
+            cdeck.CDeckError,
+            "JPEG must start with FF D8",
+        ):
+            cdeck.build_collection(
+                csv_path,
+                root / "output.cdeck",
+            )
+
     def test_source_equivalence_passes(self):
         rows = [
             {
@@ -590,8 +680,8 @@ class CDeckVerifierTests(unittest.TestCase):
         root, csv_path = self.make_source(
             rows,
             files={
-                "images/deck_001_A.jpg": b"AAA",
-                "images/deck_002_B.jpg": b"BBBB",
+                "images/deck_001_A.jpg": b"\xff\xd8A",
+                "images/deck_002_B.jpg": b"\xff\xd8BB",
             },
         )
 
@@ -626,7 +716,7 @@ class CDeckVerifierTests(unittest.TestCase):
         root, csv_path = self.make_source(
             rows,
             files={
-                "images/deck_001_A.jpg": b"AAA",
+                "images/deck_001_A.jpg": b"\xff\xd8A",
             },
         )
 
@@ -638,7 +728,7 @@ class CDeckVerifierTests(unittest.TestCase):
         )
 
         image = root / "images/deck_001_A.jpg"
-        image.write_bytes(b"AAB")
+        image.write_bytes(b"\xff\xd8B")
 
         with self.assertRaisesRegex(
             cdeck.CDeckError,
@@ -663,7 +753,7 @@ class CDeckVerifierTests(unittest.TestCase):
         root, csv_path = self.make_source(
             rows,
             files={
-                "images/deck_001_A.jpg": b"AAA",
+                "images/deck_001_A.jpg": b"\xff\xd8A",
             },
         )
 
@@ -770,6 +860,145 @@ class CDeckVerifierTests(unittest.TestCase):
             index["decks"][0],
         )
 
+
+    def test_v2_verify_canonical_accepts_writer_encoding(self):
+        path = self.write_archive(
+            {"decks": [self.make_record()]},
+            payload=b"x",
+        )
+
+        status, stdout, stderr = self.run_cli(
+            "verify",
+            str(path),
+            "--canonical",
+        )
+
+        self.assertEqual(status, 0)
+        self.assertIn("format: CDECK001", stdout)
+        self.assertEqual(stderr, "")
+
+    def test_v2_verify_canonical_rejects_structurally_valid_noncanonical_index(self):
+        index = {"decks": [self.make_record()]}
+        raw = json.dumps(
+            index,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        path = self.write_bytes(
+            b"CDECK001"
+            + struct.pack("<I", len(raw))
+            + raw
+            + b"x"
+        )
+
+        self.assertEqual(
+            cdeck.verify_file(path)["recordCount"],
+            1,
+        )
+
+        status, stdout, stderr = self.run_cli(
+            "verify",
+            str(path),
+            "--canonical",
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("index is not canonical", stderr)
+
+    def test_v2_inspect_json_emits_json_only(self):
+        status, stdout, stderr = self.run_cli(
+            "inspect",
+            str(FIXTURES / "valid-one-record.cdeck"),
+            "--json",
+        )
+
+        self.assertEqual(status, 0)
+        result = json.loads(stdout)
+        self.assertEqual(result["format"], "CDECK001")
+        self.assertEqual(result["recordCount"], 1)
+        self.assertEqual(len(result["records"]), 1)
+        self.assertEqual(stderr, "")
+
+    def test_v2_inspect_id_filters_exact_record(self):
+        path = self.write_archive(
+            {
+                "decks": [
+                    self.make_record(id="alpha"),
+                    self.make_record(id="beta"),
+                ]
+            },
+            payload=b"xx",
+        )
+
+        status, stdout, stderr = self.run_cli(
+            "inspect",
+            str(path),
+            "--id",
+            "beta",
+        )
+
+        self.assertEqual(status, 0)
+        self.assertIn("id='beta'", stdout)
+        self.assertNotIn("id='alpha'", stdout)
+        self.assertEqual(stderr, "")
+
+    def test_v2_inspect_id_rejects_unknown_record(self):
+        path = self.write_archive(
+            {"decks": [self.make_record(id="alpha")]},
+            payload=b"x",
+        )
+
+        status, stdout, stderr = self.run_cli(
+            "inspect",
+            str(path),
+            "--id",
+            "missing",
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("record id not found: missing", stderr)
+
+    def test_v2_verify_quiet_has_no_success_output(self):
+        status, stdout, stderr = self.run_cli(
+            "verify",
+            str(FIXTURES / "valid-one-record.cdeck"),
+            "--quiet",
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "")
+
+    def test_v2_shared_fixture_vectors(self):
+        vectors = json.loads(
+            (FIXTURES / "vectors.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for vector in vectors:
+            path = FIXTURES / vector["file"]
+            with self.subTest(file=vector["file"]):
+                if vector["valid"]:
+                    result = cdeck.verify_file(path)
+                    self.assertEqual(
+                        result["recordCount"],
+                        vector["recordCount"],
+                    )
+                    self.assertEqual(
+                        result["expectedFileLength"],
+                        vector["expectedFileLength"],
+                    )
+                else:
+                    with self.assertRaises(
+                        cdeck.CDeckError
+                    ) as raised:
+                        cdeck.verify_file(path)
+                    self.assertIn(
+                        vector["error"],
+                        str(raised.exception),
+                    )
 
 if __name__ == "__main__":
     unittest.main()

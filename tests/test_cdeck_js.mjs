@@ -16,6 +16,45 @@ const fixture = (name) => (
   )
 );
 
+const sharedVectors = JSON.parse(
+  fs.readFileSync(
+    new URL("fixtures/vectors.json", import.meta.url),
+    "utf8",
+  ),
+);
+
+test(
+  "V2: Python and JavaScript share fixture vectors",
+  () => {
+    for (const vector of sharedVectors) {
+      if (vector.valid) {
+        const result = parseCdeckBuffer(
+          fixture(vector.file),
+        );
+        assert.equal(
+          result.recordCount,
+          vector.recordCount,
+        );
+        assert.equal(
+          result.expectedFileLength,
+          vector.expectedFileLength,
+        );
+      } else {
+        assert.throws(
+          () => parseCdeckBuffer(
+            fixture(vector.file),
+          ),
+          (error) => (
+            error instanceof CDeckError
+            && error.message.includes(vector.error)
+          ),
+          vector.file,
+        );
+      }
+    }
+  },
+);
+
 const invalid = [
   ["wrong-magic.cdeck", /wrong magic/],
   [
@@ -402,6 +441,177 @@ test("HTTP 200 fallback validates bounds", async () => {
 });
 
 
+test("V2: strong ETag locks HTTP source snapshot", async () => {
+  let request = 0;
+  let bodyReads = 0;
+  const quote = String.fromCharCode(34);
+  const source = createHttpSource(
+    "test-source",
+    async () => {
+      request += 1;
+      return {
+        status: 206,
+        headers: new Headers({
+          "Content-Range": request === 1 ? "bytes 0-1/10" : "bytes 2-3/10",
+          ETag: quote + (request === 1 ? "snapshot-a" : "snapshot-b") + quote,
+        }),
+        async arrayBuffer() {
+          bodyReads += 1;
+          return Uint8Array.from([1, 2]).buffer;
+        },
+      };
+    },
+  );
+
+  await source.read(0, 2);
+
+  await assert.rejects(
+    source.read(2, 2),
+    /ETag changed/,
+  );
+
+  assert.equal(bodyReads, 1);
+});
+
+test("V2: weak ETag does not lock HTTP source snapshot", async () => {
+  let request = 0;
+  const quote = String.fromCharCode(34);
+  const source = createHttpSource(
+    "test-source",
+    async () => {
+      request += 1;
+      return new Response(
+        Uint8Array.from([request, request]),
+        {
+          status: 206,
+          headers: {
+            "Content-Range": request === 1 ? "bytes 0-1/10" : "bytes 2-3/10",
+            ETag: "W/" + quote + (request === 1 ? "one" : "two") + quote,
+          },
+        },
+      );
+    },
+  );
+
+  await source.read(0, 2);
+  await source.read(2, 2);
+
+  assert.equal(request, 2);
+});
+
+test("V2: HTTP source captures and enforces numeric total size", async () => {
+  let request = 0;
+  let bodyReads = 0;
+  const source = createHttpSource(
+    "test-source",
+    async () => {
+      request += 1;
+      return {
+        status: 206,
+        headers: new Headers({
+          "Content-Range": request === 1 ? "bytes 0-1/10" : "bytes 2-3/11",
+        }),
+        async arrayBuffer() {
+          bodyReads += 1;
+          return Uint8Array.from([1, 2]).buffer;
+        },
+      };
+    },
+  );
+
+  assert.equal(source.size, null);
+  await source.read(0, 2);
+  assert.equal(source.size, 10);
+
+  await assert.rejects(
+    source.read(2, 2),
+    /file size changed/,
+  );
+
+  assert.equal(bodyReads, 1);
+  assert.equal(source.size, 10);
+});
+
+test("V2: hidden Content-Range leaves HTTP source size unknown", async () => {
+  const source = createHttpSource(
+    "test-source",
+    async () => new Response(
+      Uint8Array.from([7, 8]),
+      { status: 206 },
+    ),
+  );
+
+  await source.read(5, 2);
+  assert.equal(source.size, null);
+});
+
+test("V2: HTTP 200 fallback records complete source size", async () => {
+  const source = createHttpSource(
+    "test-source",
+    async () => new Response(
+      Uint8Array.from([0, 1, 2, 3, 4, 5]),
+      { status: 200 },
+    ),
+  );
+
+  assert.equal(source.size, null);
+  await source.read(2, 2);
+  assert.equal(source.size, 6);
+});
+
+function httpArchiveSource(bytes, total) {
+  const indexLength = new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  ).getUint32(8, true);
+  const payloadStart = 12 + indexLength;
+  let request = 0;
+
+  return createHttpSource(
+    "test-source",
+    async () => {
+      request += 1;
+      const start = request === 1 ? 0 : 12;
+      const end = request === 1 ? 12 : payloadStart;
+
+      return new Response(
+        bytes.slice(start, end),
+        {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes ${start}-${end - 1}/${total}`,
+          },
+        },
+      );
+    },
+  );
+}
+
+test("V2: openCdeck accepts matching known source size", async () => {
+  const bytes = fixture("valid-one-record.cdeck");
+  const source = httpArchiveSource(bytes, bytes.byteLength);
+
+  const result = await openCdeck(source);
+
+  assert.equal(source.size, bytes.byteLength);
+  assert.equal(result.expectedFileLength, bytes.byteLength);
+  assert.equal(result.recordCount, 1);
+});
+
+test("V2: openCdeck rejects mismatched known source size", async () => {
+  const bytes = fixture("valid-one-record.cdeck");
+  const source = httpArchiveSource(
+    bytes,
+    bytes.byteLength + 1,
+  );
+
+  await assert.rejects(
+    openCdeck(source),
+    /file length mismatch/,
+  );
+});
+
 function lazyHarness() {
   let instance;
   let observerCount = 0;
@@ -441,6 +651,243 @@ function lazyHarness() {
     },
   };
 }
+
+test("V2: HTTP source forwards optional abort signal", async () => {
+  const controller = new AbortController();
+  let seenSignal = null;
+  const source = createHttpSource(
+    "test-source",
+    async (url, options) => {
+      seenSignal = options.signal ?? null;
+      return new Response(
+        Uint8Array.from([1, 2]),
+        {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-1/2",
+          },
+        },
+      );
+    },
+  );
+
+  await source.read(0, 2, controller.signal);
+  assert.equal(seenSignal, controller.signal);
+});
+
+test("V2: lazy failure reports once and callback can retry", async () => {
+  const harness = lazyHarness();
+  const target = {};
+  const record = {
+    jpegOffset: 10,
+    jpegLength: 1,
+  };
+  const errors = [];
+  let attempts = 0;
+  let retryPromise;
+  let loader;
+
+  loader = createLazyImageLoader(
+    {
+      async read() {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("broken read");
+        }
+        return Uint8Array.from([1]);
+      },
+    },
+    {
+      IntersectionObserver: harness.FakeObserver,
+      createObjectURL: () => "blob:retry",
+      revokeObjectURL: () => {},
+      onError(error, errorTarget, errorRecord) {
+        errors.push([error, errorTarget, errorRecord]);
+        retryPromise = loader.retry(errorTarget);
+      },
+    },
+  );
+
+  loader.observe(target, record);
+
+  await harness.instance.trigger([
+    {
+      target,
+      isIntersecting: true,
+    },
+  ]).catch(() => {});
+
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][0].message, "broken read");
+  assert.equal(errors[0][1], target);
+  assert.equal(errors[0][2], record);
+
+  await retryPromise;
+
+  assert.equal(attempts, 2);
+  assert.equal(target.src, "blob:retry");
+});
+
+test("V2: retry never duplicates an in-flight load", async () => {
+  const harness = lazyHarness();
+  const target = {};
+  let reads = 0;
+  let resolveRead;
+
+  const loader = createLazyImageLoader(
+    {
+      read() {
+        reads += 1;
+        return new Promise((resolve) => {
+          resolveRead = resolve;
+        });
+      },
+    },
+    {
+      IntersectionObserver: harness.FakeObserver,
+      createObjectURL: () => "blob:single",
+      revokeObjectURL: () => {},
+    },
+  );
+
+  loader.observe(
+    target,
+    {
+      jpegOffset: 20,
+      jpegLength: 1,
+    },
+  );
+
+  const pending = harness.instance.trigger([
+    {
+      target,
+      isIntersecting: true,
+    },
+  ]);
+
+  const retry = loader.retry(target);
+
+  assert.equal(reads, 1);
+
+  resolveRead(Uint8Array.from([1]));
+
+  await pending;
+  await retry;
+
+  assert.equal(reads, 1);
+  assert.equal(target.src, "blob:single");
+});
+
+test("V2: release aborts load and blocks late installation", async () => {
+  const harness = lazyHarness();
+  const target = {};
+  let seenSignal = null;
+  let resolveRead;
+
+  const loader = createLazyImageLoader(
+    {
+      read(start, length, signal) {
+        seenSignal = signal ?? null;
+        return new Promise((resolve) => {
+          resolveRead = resolve;
+        });
+      },
+    },
+    {
+      IntersectionObserver: harness.FakeObserver,
+      createObjectURL: () => "blob:late",
+      revokeObjectURL: () => {},
+    },
+  );
+
+  loader.observe(
+    target,
+    {
+      jpegOffset: 30,
+      jpegLength: 1,
+    },
+  );
+
+  const pending = harness.instance.trigger([
+    {
+      target,
+      isIntersecting: true,
+    },
+  ]);
+
+  loader.release(target);
+  resolveRead(Uint8Array.from([1]));
+
+  await pending;
+
+  assert.ok(seenSignal);
+  assert.equal(seenSignal.aborted, true);
+  assert.equal(target.src, undefined);
+});
+
+test("V2: disconnect aborts active loads without onError", async () => {
+  const harness = lazyHarness();
+  const targets = [{}, {}];
+  const signals = [];
+  const errors = [];
+
+  const loader = createLazyImageLoader(
+    {
+      read(start, length, signal) {
+        signals.push(signal ?? null);
+        return new Promise((resolve, reject) => {
+          if (!signal) {
+            reject(new Error("missing abort signal"));
+            return;
+          }
+
+          signal.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+    {
+      IntersectionObserver: harness.FakeObserver,
+      createObjectURL: () => "blob:unused",
+      revokeObjectURL: () => {},
+      onError: (error) => errors.push(error),
+    },
+  );
+
+  for (let index = 0; index < targets.length; index += 1) {
+    loader.observe(
+      targets[index],
+      {
+        jpegOffset: 40 + index,
+        jpegLength: 1,
+      },
+    );
+  }
+
+  const pending = harness.instance.trigger(
+    targets.map((target) => ({
+      target,
+      isIntersecting: true,
+    })),
+  ).catch((error) => error);
+
+  await Promise.resolve();
+  loader.disconnect();
+
+  const outcome = await pending;
+
+  assert.equal(outcome, undefined);
+  assert.equal(signals.length, 2);
+  assert.ok(signals.every((signal) => signal?.aborted));
+  assert.equal(errors.length, 0);
+});
 
 test("lazy loader does not fetch offscreen images", async () => {
   const harness = lazyHarness();

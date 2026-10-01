@@ -66,19 +66,19 @@ The index contains the metadata for each record and the length of its JPEG.
 
 Because the JPEGs are stored back-to-back, the reader doesn't need to store an offset for every image. It can calculate them.
 
-The current format is:
+The current file format is:
 
 ```text
 CDECK001
 ```
 
-The first software release is:
+The published software release is:
 
 ```text
 v1
 ```
 
-Those are intentionally separate. A future CDECK v2 doesn't automatically mean the file format has to change.
+Current V2 development still reads and writes `CDECK001`. Software release numbering and file-format generation are intentionally separate.
 
 ## What Goes in a Record?
 
@@ -115,6 +115,8 @@ src,name,quantity,brand,printer
 
 The builder validates the input, builds the file, verifies it, and then replaces the destination atomically.
 
+Before reading a source JPEG, the builder resolves its path inside the CSV source directory, rejects paths that escape that directory, and requires the file to begin with the JPEG SOI bytes `FF D8`. Symlinks that resolve inside the source directory are allowed; escaping symlinks are rejected. Accepted JPEG bytes are copied unchanged.
+
 One thing I cared about from the beginning was deterministic output.
 
 If the source data hasn't changed, rebuilding the collection should produce the exact same bytes.
@@ -133,6 +135,20 @@ Or limit how many records it prints:
 python3 cdeck.py inspect collection.cdeck --limit 10
 ```
 
+For machine-readable inspection:
+
+```bash
+python3 cdeck.py inspect collection.cdeck --json
+```
+
+To select one record by exact ID:
+
+```bash
+python3 cdeck.py inspect collection.cdeck --id deck_example
+```
+
+`--json` keeps stdout machine-readable, while diagnostics continue to use stderr.
+
 This is mostly there because I wanted an easy way to look inside the format without writing another tool every time I was debugging something.
 
 ## Verifying One
@@ -148,6 +164,20 @@ Source-aware verification:
 ```bash
 python3 cdeck.py verify collection.cdeck --source decks.csv
 ```
+
+For silent successful validation:
+
+```bash
+python3 cdeck.py verify collection.cdeck --quiet
+```
+
+For exact canonical-index verification:
+
+```bash
+python3 cdeck.py verify collection.cdeck --canonical
+```
+
+Ordinary validity and canonical encoding are intentionally different checks. A reader can accept structurally valid `CDECK001` that uses noncanonical JSON encoding, while `--canonical` requires the index bytes to match the deterministic writer encoding exactly.
 
 When the original source files are available, CDECK can compare every embedded JPEG against the original using SHA-256.
 
@@ -172,6 +202,10 @@ const source = createHttpSource("collection.cdeck");
 const collection = await openCdeck(source);
 ```
 
+The HTTP source tracks representation identity and size when the server exposes them. The first visible strong ETag locks the source snapshot, while weak ETags do not. Numeric `Content-Range` totals must stay consistent, and once the complete source size is known it must equal the file length derived from the CDECK index.
+
+A server without a visible strong validator still works; it simply does not provide the same hard snapshot guarantee. CDECK does not add a preliminary `HEAD` request.
+
 The reader starts by requesting just the 12-byte header.
 
 Then it requests the JSON index.
@@ -187,6 +221,8 @@ This was one of the parts I didn't want to lose when moving everything into one 
 CDECK uses `IntersectionObserver` so images can still load on demand.
 
 When an image gets close to the viewport, the reader calculates its byte range, requests those bytes, creates an `image/jpeg` Blob, and gives the resulting object URL to the image element.
+
+The lazy loader also supports an optional `onError(error, target, record)` callback and explicit `retry(target)`. Releasing a target aborts its outstanding request and prevents a late result from being installed. Disconnecting the loader stops observation and aborts all active loads. Expected aborts are treated as cleanup rather than ordinary load errors.
 
 So even though the collection is physically stored as one file, the browser doesn't have to treat it like one giant download.
 
@@ -208,7 +244,7 @@ And a static server can return just that part of the file with:
 
 But I didn't want CDECK to completely fall apart on a server that ignores Range requests.
 
-If the server responds with the entire file using `200 OK`, the reader can keep that response in memory and satisfy later reads from local slices instead.
+If the server responds with the entire file using `200 OK`, the reader receives and validates the complete body before caching it, records that body length as the source size, and satisfies later reads from local slices.
 
 So Range support is an optimization, not a hard requirement.
 
@@ -284,7 +320,7 @@ If you want the exact rules and validation requirements, see [`SPEC.md`](SPEC.md
 
 ## A Few Things I Care About
 
-CDECK v1 was built around a few simple rules:
+CDECK is built around a few simple rules:
 
 - same input should produce the same output
 - original JPEG bytes should stay unchanged
@@ -304,6 +340,7 @@ cdeck.py
 cdeck.js
 SPEC.md
 tests/
+.github/workflows/ci.yml
 ```
 
 `cdeck.py` contains the builder, verifier, and inspection commands.
@@ -313,6 +350,10 @@ tests/
 `SPEC.md` is the actual file-format specification.
 
 `tests/` contains the Python and JavaScript test suites along with valid and intentionally broken CDECK fixtures.
+
+The shared `tests/fixtures/vectors.json` manifest gives both runtimes the same expected fixture results.
+
+The GitHub Actions workflow runs both test suites, checks diff integrity, and enforces the 1,000-line production-code ceiling.
 
 ## Requirements
 

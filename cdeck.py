@@ -137,15 +137,33 @@ def verify_file(path):
         raise CDeckError(f'file length mismatch: expected {expected_file_length}, actual {file_size}')
     return {'format': 'CDECK001', 'indexLength': index_length, 'payloadStart': payload_start, 'recordCount': len(decks), 'payloadBytes': payload_bytes, 'expectedFileLength': expected_file_length, 'offsets': offsets, 'warnings': warnings}
 
+def _read_verified_decks(path, result, context, raw=False):
+    with path.open("rb") as handle:
+        handle.seek(HEADER_SIZE)
+        raw_index = handle.read(result["indexLength"])
+    if len(raw_index) != result["indexLength"]:
+        raise CDeckError(f"archive changed during {context}")
+    decks = _decode_index(raw_index)["decks"]
+    return (raw_index, decks) if raw else decks
+
+def verify_canonical(path, result=None):
+    path = Path(path)
+    result = result or verify_file(path)
+    raw, decks = _read_verified_decks(
+        path, result, "canonical verification", True
+    )
+    records = [
+        {field: deck[field] for field in REQUIRED_FIELDS}
+        for deck in decks
+    ]
+    if raw != _encode_canonical_index(records):
+        raise CDeckError("index is not canonical")
+    return result
+
 def inspect_file(path):
     path = Path(path)
     result = verify_file(path)
-    with path.open('rb') as handle:
-        handle.seek(HEADER_SIZE)
-        raw_index = handle.read(result['indexLength'])
-    if len(raw_index) != result['indexLength']:
-        raise CDeckError('archive changed during inspection')
-    decks = _decode_index(raw_index)['decks']
+    decks = _read_verified_decks(path, result, 'inspection')
     records = []
     for deck, offset in zip(decks, result['offsets'], strict=True):
         record = dict(deck)
@@ -177,18 +195,14 @@ def verify_source(path, csv_path):
     csv_path = Path(csv_path).resolve()
     result = verify_file(path)
     source_records, source_paths = _read_source(csv_path)
-    with path.open('rb') as handle:
-        handle.seek(HEADER_SIZE)
-        raw_index = handle.read(result['indexLength'])
-    if len(raw_index) != result['indexLength']:
-        raise CDeckError('archive changed during source verification')
-    archive_records = _decode_index(raw_index)['decks']
+    archive_records = _read_verified_decks(
+        path, result, 'source verification'
+    )
     if len(source_records) != len(archive_records):
         raise CDeckError(f'source record count mismatch: {len(source_records)} != {len(archive_records)}')
-    fields = ('id', 'name', 'quantity', 'brand', 'printer', 'jpegLength')
     rows = zip(source_records, source_paths, archive_records, result['offsets'], strict=True)
     for number, (source_record, source_path, archive_record, offset) in enumerate(rows, start=1):
-        for field in fields:
+        for field in REQUIRED_FIELDS:
             if source_record[field] != archive_record[field]:
                 raise CDeckError(f'record {number}: metadata mismatch: {field}')
         source_hash = _sha256(source_path)
@@ -220,6 +234,7 @@ def _read_source(csv_path):
         rows = list(reader)
     if len(rows) > MAX_RECORDS:
         raise CDeckError('record count exceeds limit')
+    root = csv_path.parent.resolve(strict=True)
     records = []
     source_paths = []
     for row_number, row in enumerate(rows, start=2):
@@ -235,9 +250,19 @@ def _read_source(csv_path):
             raise CDeckError(f'source row {row_number}: unsafe src path')
         if source_ref.suffix.lower() not in ('.jpg', '.jpeg'):
             raise CDeckError(f'source row {row_number}: src must reference JPEG')
-        jpeg_path = csv_path.parent / source_ref
+        try:
+            jpeg_path = (root / source_ref).resolve(strict=True)
+        except OSError:
+            raise CDeckError(f'source row {row_number}: missing JPEG: {src}')
+        try:
+            jpeg_path.relative_to(root)
+        except ValueError:
+            raise CDeckError(f'source row {row_number}: unsafe src path')
         if not jpeg_path.is_file():
             raise CDeckError(f'source row {row_number}: missing JPEG: {src}')
+        with jpeg_path.open('rb') as jpeg:
+            if jpeg.read(2) != b'\xff\xd8':
+                raise CDeckError(f'source row {row_number}: JPEG must start with FF D8')
         quantity_text = row['quantity'].strip()
         if not quantity_text or not quantity_text.isascii() or (not quantity_text.isdigit()):
             raise CDeckError(f'source row {row_number}: invalid quantity')
@@ -313,26 +338,62 @@ def _print_summary(result):
     for warning in result['warnings']:
         print(f'warning: {warning}', file=sys.stderr)
 
-def _verify_command(path, source=None):
-    if source:
-        result = verify_source(path, source)
+def _verify_command(
+    path, source=None, quiet=False, canonical=False
+):
+    result = (
+        verify_source(path, source)
+        if source else verify_file(path)
+    )
+    if canonical:
+        verify_canonical(path, result)
+    if quiet:
+        for warning in result["warnings"]:
+            print(f"warning: {warning}", file=sys.stderr)
     else:
-        result = verify_file(path)
-    _print_summary(result)
+        _print_summary(result)
 
-def _inspect_command(path, limit):
+def _inspect_command(
+    path, limit, json_output=False, record_id=None
+):
     result = inspect_file(path)
+    records = result["records"]
+    if record_id is not None:
+        records = [
+            record for record in records
+            if record["id"] == record_id
+        ]
+        if not records:
+            raise CDeckError(
+                f"record id not found: {record_id}"
+            )
+        result = dict(result)
+        result["records"] = records
+    if json_output:
+        print(json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
+        return
     _print_summary(result)
-    print('payload starts:', result['payloadStart'])
-    records = result['records']
-    if limit is None:
-        shown = records
-    else:
-        shown = records[:limit]
+    print("payload starts:", result["payloadStart"])
+    shown = records if limit is None else records[:limit]
     for number, record in enumerate(shown, start=1):
-        print(f"{number}: id={record['id']!r} offset={record['jpegOffset']} length={record['jpegLength']} quantity={record['quantity']} name={record['name']!r}")
+        print(
+            "{}: id={!r} offset={} length={} quantity={} name={!r}".format(
+                number,
+                record["id"],
+                record["jpegOffset"],
+                record["jpegLength"],
+                record["quantity"],
+                record["name"],
+            )
+        )
     if len(shown) != len(records):
-        print(f'... {len(records) - len(shown)} record(s) not shown')
+        print(
+            f"... {len(records) - len(shown)} record(s) not shown"
+        )
 
 def _build_command(csv_path, output_path):
     result = build_collection(csv_path, output_path)
@@ -340,30 +401,49 @@ def _build_command(csv_path, output_path):
     _print_summary(result)
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='cdeck')
-    subparsers = parser.add_subparsers(dest='command', required=True)
-    build_parser = subparsers.add_parser('build')
-    build_parser.add_argument('csv')
-    build_parser.add_argument('output')
-    inspect_parser = subparsers.add_parser('inspect')
-    inspect_parser.add_argument('path')
-    inspect_parser.add_argument('--limit', type=int, default=20)
-    verify_parser = subparsers.add_parser('verify')
-    verify_parser.add_argument('path')
-    verify_parser.add_argument('--source')
+    parser = argparse.ArgumentParser(prog="cdeck")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True
+    )
+    build_parser = subparsers.add_parser("build")
+    build_parser.add_argument("csv")
+    build_parser.add_argument("output")
+    inspect_parser = subparsers.add_parser("inspect")
+    inspect_parser.add_argument("path")
+    inspect_parser.add_argument("--limit", type=int, default=20)
+    inspect_parser.add_argument("--json", action="store_true")
+    inspect_parser.add_argument("--id")
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("path")
+    verify_parser.add_argument("--source")
+    verify_parser.add_argument("--quiet", action="store_true")
+    verify_parser.add_argument("--canonical", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.command == 'build':
+        if args.command == "build":
             _build_command(args.csv, args.output)
-        elif args.command == 'inspect':
+        elif args.command == "inspect":
             if args.limit is not None and args.limit < 0:
-                raise CDeckError('inspect limit must not be negative')
-            _inspect_command(args.path, args.limit)
+                raise CDeckError(
+                    "inspect limit must not be negative"
+                )
+            _inspect_command(
+                args.path,
+                args.limit,
+                args.json,
+                args.id,
+            )
         else:
-            _verify_command(args.path, args.source)
+            _verify_command(
+                args.path,
+                args.source,
+                args.quiet,
+                args.canonical,
+            )
     except (CDeckError, OSError) as exc:
-        print(f'cdeck: {exc}', file=sys.stderr)
+        print(f"cdeck: {exc}", file=sys.stderr)
         return 1
     return 0
+
 if __name__ == '__main__':
     raise SystemExit(main())

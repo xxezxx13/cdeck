@@ -1,0 +1,53 @@
+[
+  {
+    "file": "valid-one-record.cdeck",
+    "valid": true,
+    "recordCount": 1,
+    "expectedFileLength": 11720
+  },
+  {
+    "file": "wrong-magic.cdeck",
+    "valid": false,
+    "error": "wrong magic"
+  },
+  {
+    "file": "unsupported-generation.cdeck",
+    "valid": false,
+    "error": "unsupported CDECK generation"
+  },
+  {
+    "file": "zero-index.cdeck",
+    "valid": false,
+    "error": "indexLength must be greater than zero"
+  },
+  {
+    "file": "malformed-utf8.cdeck",
+    "valid": false,
+    "error": "invalid UTF-8 index"
+  },
+  {
+    "file": "invalid-json.cdeck",
+    "valid": false,
+    "error": "invalid JSON index"
+  },
+  {
+    "file": "duplicate-id.cdeck",
+    "valid": false,
+    "error": "duplicate id"
+  },
+  {
+    "file": "invalid-quantity.cdeck",
+    "valid": false,
+    "error": "quantity out of range"
+  },
+  {
+    "file": "invalid-jpeg-length.cdeck",
+    "valid": false,
+    "error": "jpegLength out of range"
+  },
+  {
+    "file": "truncated-payload.cdeck",
+    "valid": false,
+    "error": "file length mismatch"
+  }
+]

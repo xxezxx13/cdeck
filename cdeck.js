@@ -133,7 +133,7 @@ function validateRead(start, length) {
   return end;
 }
 function validateContentRange(value, start, end) {
-  if (value === null) return;
+  if (value === null) return null;
   const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(value);
   if (!match) throw new CDeckError("invalid Content-Range");
   if (
@@ -144,18 +144,19 @@ function validateContentRange(value, start, end) {
       "Content-Range does not match requested range",
     );
   }
-  if (match[3] !== "*") {
-    const total = Number(match[3]);
-    if (
-      !Number.isSafeInteger(total)
-      || total > MAX_FILE_BYTES
-      || end > total
-    ) {
-      throw new CDeckError("invalid Content-Range total");
-    }
+  if (match[3] === "*") return null;
+  const total = Number(match[3]);
+  if (
+    !Number.isSafeInteger(total)
+    || total > MAX_FILE_BYTES
+    || end > total
+  ) {
+    throw new CDeckError("invalid Content-Range total");
   }
+  return total;
 }
 function networkError(error) {
+  if (error?.name === "AbortError") return error;
   const message = error instanceof Error ? error.message : error;
   return new CDeckError(`network failure: ${message}`);
 }
@@ -164,54 +165,79 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
     throw new CDeckError("fetch implementation is required");
   }
   let fullBody = null;
+  let etag = null;
+  let size = null;
   return {
-    async read(start, length) {
+    get size() {
+      return size;
+    },
+    async read(start, length, signal) {
       const end = validateRead(start, length);
-      if (fullBody !== null) {
-        if (end > fullBody.byteLength) {
+      if (fullBody === null) {
+        let response;
+        try {
+          response = await fetchImpl(url, {
+            method: "GET",
+            headers: { Range: `bytes=${start}-${end - 1}` },
+            signal,
+          });
+        } catch (error) {
+          throw networkError(error);
+        }
+        if (response.status !== 200 && response.status !== 206) {
           throw new CDeckError(
-            "full response shorter than requested range",
+            `unexpected HTTP status: ${response.status}`,
           );
         }
-        return fullBody.slice(start, end);
-      }
-      let response;
-      try {
-        response = await fetchImpl(url, {
-          method: "GET",
-          headers: { Range: `bytes=${start}-${end - 1}` },
-        });
-      } catch (error) {
-        throw networkError(error);
-      }
-      if (response.status !== 200 && response.status !== 206) {
-        throw new CDeckError(
-          `unexpected HTTP status: ${response.status}`,
+
+        const responseEtag = response.headers.get("ETag");
+        const strongEtag = (
+          responseEtag !== null && !responseEtag.startsWith("W/")
+            ? responseEtag
+            : null
         );
-      }
-      let body;
-      try {
-        body = new Uint8Array(await response.arrayBuffer());
-      } catch (error) {
-        throw networkError(error);
-      }
-      if (response.status === 206) {
-        if (body.byteLength !== length) {
-          throw new CDeckError(
-            `partial response length mismatch: expected ${length}, actual ${body.byteLength}`,
-          );
+        if (etag !== null && strongEtag !== etag) {
+          throw new CDeckError("ETag changed");
         }
-        validateContentRange(
-          response.headers.get("Content-Range"),
-          start,
-          end,
-        );
-        return body;
+        if (etag === null && strongEtag !== null) etag = strongEtag;
+
+        if (response.status === 206) {
+          const total = validateContentRange(
+            response.headers.get("Content-Range"),
+            start,
+            end,
+          );
+          if (total !== null) {
+            if (size !== null && total !== size) {
+              throw new CDeckError("file size changed");
+            }
+            size = total;
+          }
+        }
+
+        let body;
+        try {
+          body = new Uint8Array(await response.arrayBuffer());
+        } catch (error) {
+          throw networkError(error);
+        }
+        if (response.status === 206) {
+          if (body.byteLength !== length) {
+            throw new CDeckError(
+              `partial response length mismatch: expected ${length}, actual ${body.byteLength}`,
+            );
+          }
+          return body;
+        }
+        if (body.byteLength > MAX_FILE_BYTES) {
+          throw new CDeckError("full response exceeds 32-bit file limit");
+        }
+        if (size !== null && body.byteLength !== size) {
+          throw new CDeckError("file size changed");
+        }
+        size = body.byteLength;
+        fullBody = body;
       }
-      if (body.byteLength > MAX_FILE_BYTES) {
-        throw new CDeckError("full response exceeds 32-bit file limit");
-      }
-      fullBody = body;
       if (end > fullBody.byteLength) {
         throw new CDeckError(
           "full response shorter than requested range",
@@ -246,29 +272,59 @@ export function createLazyImageLoader(source, options = {}) {
   ) {
     throw new CDeckError("Blob URL support is required");
   }
+
   const states = new Map();
   const load = async (target) => {
     const state = states.get(target);
     if (!state || state.url) return state?.url;
-    if (!state.promise) {
-      state.promise = source.read(
-        state.record.jpegOffset,
-        state.record.jpegLength,
-      ).then((bytes) => {
-        if (states.get(target) !== state) return null;
+    if (state.promise) return state.promise;
+
+    const controller = new AbortController();
+    state.controller = controller;
+    state.promise = (async () => {
+      try {
+        const bytes = await source.read(
+          state.record.jpegOffset,
+          state.record.jpegLength,
+          controller.signal,
+        );
+        if (
+          states.get(target) !== state
+          || controller.signal.aborted
+        ) {
+          return null;
+        }
         const url = createUrl(
           new Blob([bytes], { type: "image/jpeg" }),
         );
         state.url = url;
         state.image.src = url;
         return url;
-      }).catch((error) => {
+      } catch (error) {
+        if (
+          states.get(target) !== state
+          || error?.name === "AbortError"
+        ) {
+          return null;
+        }
         state.promise = null;
+        state.controller = null;
+        options.onError?.(error, target, state.record);
         throw error;
-      });
-    }
+      } finally {
+        if (
+          states.get(target) === state
+          && state.controller === controller
+        ) {
+          state.controller = null;
+          if (state.url) state.promise = null;
+        }
+      }
+    })();
+
     return state.promise;
   };
+
   const observer = new Observer(async (entries) => {
     const jobs = [];
     for (const entry of entries) {
@@ -284,12 +340,15 @@ export function createLazyImageLoader(source, options = {}) {
     }
     await Promise.all(jobs);
   }, options.observerOptions);
+
   const release = (target) => {
     const state = states.get(target);
     observer.unobserve(target);
+    state?.controller?.abort();
     if (state?.url) revokeUrl(state.url);
     states.delete(target);
   };
+
   return {
     observe(target, record, image = target) {
       if (states.has(target)) return;
@@ -297,18 +356,16 @@ export function createLazyImageLoader(source, options = {}) {
         record,
         image,
         promise: null,
+        controller: null,
         url: null,
       });
       observer.observe(target);
     },
+    retry: load,
     release,
     disconnect() {
       observer.disconnect();
-      for (const [target] of states) {
-        const state = states.get(target);
-        if (state?.url) revokeUrl(state.url);
-      }
-      states.clear();
+      for (const [target] of states) release(target);
     },
   };
 }
@@ -417,6 +474,7 @@ export async function openCdeck(source) {
   return collectionFromIndex(
     indexLength,
     index,
+    source.size ?? null,
   );
 }
 export function parseCdeckBuffer(input) {
