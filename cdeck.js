@@ -1,12 +1,11 @@
-const MAGIC = "CDECK001";
+const MAGIC = "CDECK002";
 const HEADER_SIZE = 12;
-const MAX_INDEX_BYTES = 2_000_000;
+const MAX_INDEX_BYTES = 16 * 1024 * 1024;
 const MAX_RECORDS = 4_000;
-const MAX_FILE_BYTES = 0xffffffff;
-const FIELDS = ["id", "name", "quantity", "brand", "printer", "jpegLength"];
-const LIMITS = { id: 500, name: 1000, brand: 500, printer: 500 };
+const DEFAULT_MAX_FULL_BYTES = 64 * 1024 * 1024;
+const FIELDS = ["id", "length", "meta"];
+const OFFSET = Symbol("cdeck.offset");
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const encoder = new TextEncoder();
 export class CDeckError extends Error {}
 function bytesFrom(input) {
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
@@ -14,31 +13,6 @@ function bytesFrom(input) {
     return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
   }
   throw new CDeckError("input must be an ArrayBuffer or typed array");
-}
-function requireString(record, field, number) {
-  const value = record[field];
-  if (typeof value !== "string") {
-    throw new CDeckError(`record ${number}: ${field} must be a string`);
-  }
-  if (field === "id" && !value) {
-    throw new CDeckError(`record ${number}: id must not be empty`);
-  }
-  if (encoder.encode(value).byteLength > LIMITS[field]) {
-    throw new CDeckError(
-      `record ${number}: ${field} exceeds UTF-8 byte limit`,
-    );
-  }
-  return value;
-}
-function requireInteger(record, field, low, high, number) {
-  const value = record[field];
-  if (!Number.isInteger(value)) {
-    throw new CDeckError(`record ${number}: ${field} must be an integer`);
-  }
-  if (value < low || value > high) {
-    throw new CDeckError(`record ${number}: ${field} out of range`);
-  }
-  return value;
 }
 function decodeIndex(raw) {
   if (
@@ -61,74 +35,92 @@ function decodeIndex(raw) {
     throw new CDeckError("invalid JSON index");
   }
 }
+function validateJson(value) {
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isInteger(value)) throw new CDeckError("JSON floats are not allowed");
+    if (!Number.isSafeInteger(value)) throw new CDeckError("JSON integer exceeds safe integer limit");
+    return;
+  }
+  if (typeof value === "string") {
+    for (const char of value) {
+      const code = char.codePointAt(0);
+      if (code >= 0xd800 && code <= 0xdfff) throw new CDeckError("JSON string contains lone surrogate");
+    }
+    return;
+  }
+  if (Array.isArray(value)) { value.forEach(validateJson); return; }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) { validateJson(key); validateJson(item); }
+    return;
+  }
+  throw new CDeckError("unsupported JSON value type");
+}
 function validateIndex(index) {
-  if (
-    index === null
-    || typeof index !== "object"
-    || Array.isArray(index)
-  ) {
-    throw new CDeckError("top-level JSON value must be an object");
+  if (!Array.isArray(index)) {
+    throw new CDeckError("index must be an array");
   }
-  if (!Object.hasOwn(index, "decks")) {
-    throw new CDeckError("missing required top-level member: decks");
-  }
-  const decks = index.decks;
-  if (!Array.isArray(decks)) {
-    throw new CDeckError("decks must be an array");
-  }
-  if (decks.length > MAX_RECORDS) {
+  if (index.length > MAX_RECORDS) {
     throw new CDeckError("record count exceeds limit");
   }
   const ids = new Set();
   const records = [];
   let payloadBytes = 0;
-  for (let i = 0; i < decks.length; i += 1) {
+  for (let i = 0; i < index.length; i += 1) {
     const number = i + 1;
-    const record = decks[i];
-    if (
-      record === null
-      || typeof record !== "object"
-      || Array.isArray(record)
-    ) {
+    const record = index[i];
+    if (record === null || typeof record !== "object" || Array.isArray(record)) {
       throw new CDeckError(`record ${number}: must be an object`);
     }
     for (const field of FIELDS) {
       if (!Object.hasOwn(record, field)) {
-        throw new CDeckError(
-          `record ${number}: missing required member: ${field}`,
-        );
+        throw new CDeckError(`record ${number}: missing required member: ${field}`);
       }
     }
-    const id = requireString(record, "id", number);
-    requireString(record, "name", number);
-    requireString(record, "brand", number);
-    requireString(record, "printer", number);
-    requireInteger(record, "quantity", 1, 10_000, number);
-    const jpegLength = requireInteger(
-      record, "jpegLength", 1, MAX_FILE_BYTES, number,
-    );
+    const extra = Object.keys(record).find((field) => !FIELDS.includes(field));
+    if (extra !== undefined) {
+      throw new CDeckError(`record ${number}: unexpected member: ${extra}`);
+    }
+    const { id, length, meta } = record;
+    if (typeof id !== "string") {
+      throw new CDeckError(`record ${number}: id must be a string`);
+    }
+    if (!id) {
+      throw new CDeckError(`record ${number}: id must not be empty`);
+    }
+    if (!Number.isInteger(length)) {
+      throw new CDeckError(`record ${number}: length must be an integer`);
+    }
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new CDeckError(`record ${number}: length out of range`);
+    }
+    if (meta === null || typeof meta !== "object" || Array.isArray(meta)) {
+      throw new CDeckError(`record ${number}: meta must be an object`);
+    }
+    validateJson(id);
+    validateJson(meta);
     if (ids.has(id)) {
       throw new CDeckError(`record ${number}: duplicate id: ${id}`);
     }
     ids.add(id);
-    records.push({ ...record, jpegOffset: payloadBytes });
-    payloadBytes += jpegLength;
-    if (payloadBytes > MAX_FILE_BYTES) {
-      throw new CDeckError("cumulative JPEG payload exceeds 32-bit limit");
+    records.push({ id, length, meta, [OFFSET]: payloadBytes });
+    payloadBytes += length;
+    if (!Number.isSafeInteger(payloadBytes)) {
+      throw new CDeckError("cumulative payload length exceeds safe integer limit");
     }
   }
   return { records, payloadBytes };
 }
 function validateRead(start, length) {
-  if (!Number.isInteger(start) || start < 0) {
-    throw new CDeckError("read start must be a non-negative integer");
+  if (!Number.isSafeInteger(start) || start < 0) {
+    throw new CDeckError("read start must be a non-negative safe integer");
   }
-  if (!Number.isInteger(length) || length <= 0) {
-    throw new CDeckError("read length must be a positive integer");
+  if (!Number.isSafeInteger(length) || length <= 0) {
+    throw new CDeckError("read length must be a positive safe integer");
   }
   const end = start + length;
-  if (!Number.isSafeInteger(end) || end > MAX_FILE_BYTES) {
-    throw new CDeckError("read range exceeds 32-bit file limit");
+  if (!Number.isSafeInteger(end)) {
+    throw new CDeckError("read range exceeds safe integer limit");
   }
   return end;
 }
@@ -146,11 +138,7 @@ function validateContentRange(value, start, end) {
   }
   if (match[3] === "*") return null;
   const total = Number(match[3]);
-  if (
-    !Number.isSafeInteger(total)
-    || total > MAX_FILE_BYTES
-    || end > total
-  ) {
+  if (!Number.isSafeInteger(total) || end > total) {
     throw new CDeckError("invalid Content-Range total");
   }
   return total;
@@ -160,7 +148,13 @@ function networkError(error) {
   const message = error instanceof Error ? error.message : error;
   return new CDeckError(`network failure: ${message}`);
 }
-export function createHttpSource(url, fetchImpl = globalThis.fetch) {
+export function createHttpSource(url, {
+  maxFullBytes = DEFAULT_MAX_FULL_BYTES,
+  fetch: fetchImpl = globalThis.fetch,
+} = {}) {
+  if (!Number.isSafeInteger(maxFullBytes) || maxFullBytes < 0) {
+    throw new CDeckError("maxFullBytes must be a non-negative safe integer");
+  }
   if (typeof fetchImpl !== "function") {
     throw new CDeckError("fetch implementation is required");
   }
@@ -189,7 +183,6 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
             `unexpected HTTP status: ${response.status}`,
           );
         }
-
         const responseEtag = response.headers.get("ETag");
         const strongEtag = (
           responseEtag !== null && !responseEtag.startsWith("W/")
@@ -200,7 +193,6 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
           throw new CDeckError("ETag changed");
         }
         if (etag === null && strongEtag !== null) etag = strongEtag;
-
         if (response.status === 206) {
           const total = validateContentRange(
             response.headers.get("Content-Range"),
@@ -214,7 +206,18 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
             size = total;
           }
         }
-
+        if (response.status === 200) {
+          const value = response.headers.get("Content-Length");
+          if (value !== null) {
+            const declared = Number(value);
+            if (!Number.isSafeInteger(declared) || declared < 0) {
+              throw new CDeckError("invalid Content-Length");
+            }
+            if (declared > maxFullBytes) {
+              throw new CDeckError("full response exceeds maxFullBytes");
+            }
+          }
+        }
         let body;
         try {
           body = new Uint8Array(await response.arrayBuffer());
@@ -229,8 +232,8 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
           }
           return body;
         }
-        if (body.byteLength > MAX_FILE_BYTES) {
-          throw new CDeckError("full response exceeds 32-bit file limit");
+        if (body.byteLength > maxFullBytes) {
+          throw new CDeckError("full response exceeds maxFullBytes");
         }
         if (size !== null && body.byteLength !== size) {
           throw new CDeckError("file size changed");
@@ -244,128 +247,6 @@ export function createHttpSource(url, fetchImpl = globalThis.fetch) {
         );
       }
       return fullBody.slice(start, end);
-    },
-  };
-}
-export function createLazyImageLoader(source, options = {}) {
-  if (!source || typeof source.read !== "function") {
-    throw new CDeckError("lazy loader requires readable source");
-  }
-  const Observer = (
-    options.IntersectionObserver
-    ?? globalThis.IntersectionObserver
-  );
-  const createUrl = (
-    options.createObjectURL
-    ?? globalThis.URL?.createObjectURL?.bind(globalThis.URL)
-  );
-  const revokeUrl = (
-    options.revokeObjectURL
-    ?? globalThis.URL?.revokeObjectURL?.bind(globalThis.URL)
-  );
-  if (typeof Observer !== "function") {
-    throw new CDeckError("IntersectionObserver is required");
-  }
-  if (
-    typeof createUrl !== "function"
-    || typeof revokeUrl !== "function"
-  ) {
-    throw new CDeckError("Blob URL support is required");
-  }
-
-  const states = new Map();
-  const load = async (target) => {
-    const state = states.get(target);
-    if (!state || state.url) return state?.url;
-    if (state.promise) return state.promise;
-
-    const controller = new AbortController();
-    state.controller = controller;
-    state.promise = (async () => {
-      try {
-        const bytes = await source.read(
-          state.record.jpegOffset,
-          state.record.jpegLength,
-          controller.signal,
-        );
-        if (
-          states.get(target) !== state
-          || controller.signal.aborted
-        ) {
-          return null;
-        }
-        const url = createUrl(
-          new Blob([bytes], { type: "image/jpeg" }),
-        );
-        state.url = url;
-        state.image.src = url;
-        return url;
-      } catch (error) {
-        if (
-          states.get(target) !== state
-          || error?.name === "AbortError"
-        ) {
-          return null;
-        }
-        state.promise = null;
-        state.controller = null;
-        options.onError?.(error, target, state.record);
-        throw error;
-      } finally {
-        if (
-          states.get(target) === state
-          && state.controller === controller
-        ) {
-          state.controller = null;
-          if (state.url) state.promise = null;
-        }
-      }
-    })();
-
-    return state.promise;
-  };
-
-  const observer = new Observer(async (entries) => {
-    const jobs = [];
-    for (const entry of entries) {
-      if (
-        !entry.isIntersecting
-        || !states.has(entry.target)
-      ) {
-        continue;
-      }
-      observer.unobserve(entry.target);
-      options.onIntersect?.(entry.target);
-      jobs.push(load(entry.target));
-    }
-    await Promise.all(jobs);
-  }, options.observerOptions);
-
-  const release = (target) => {
-    const state = states.get(target);
-    observer.unobserve(target);
-    state?.controller?.abort();
-    if (state?.url) revokeUrl(state.url);
-    states.delete(target);
-  };
-
-  return {
-    observe(target, record, image = target) {
-      if (states.has(target)) return;
-      states.set(target, {
-        record,
-        image,
-        promise: null,
-        controller: null,
-        url: null,
-      });
-      observer.observe(target);
-    },
-    retry: load,
-    release,
-    disconnect() {
-      observer.disconnect();
-      for (const [target] of states) release(target);
     },
   };
 }
@@ -398,7 +279,7 @@ function readHeader(input) {
   }
   if (indexLength > MAX_INDEX_BYTES) {
     throw new CDeckError(
-      "indexLength exceeds 2,000,000 bytes",
+      "indexLength exceeds 16 MiB runtime limit",
     );
   }
   return indexLength;
@@ -409,34 +290,21 @@ function collectionFromIndex(
   actualLength = null,
 ) {
   const payloadStart = HEADER_SIZE + indexLength;
-  const {
-    records: relativeRecords,
-    payloadBytes,
-  } = validateIndex(
+  const { records, payloadBytes } = validateIndex(
     decodeIndex(bytesFrom(rawIndex)),
   );
-  const expectedFileLength = (
-    payloadStart + payloadBytes
-  );
-  if (expectedFileLength > MAX_FILE_BYTES) {
-    throw new CDeckError(
-      "derived file length exceeds 32-bit limit",
-    );
+  const expectedFileLength = payloadStart + payloadBytes;
+  if (!Number.isSafeInteger(expectedFileLength)) {
+    throw new CDeckError("derived file length exceeds safe integer limit");
   }
-  if (
-    actualLength !== null
-    && actualLength !== expectedFileLength
-  ) {
+  if (actualLength !== null && actualLength !== expectedFileLength) {
     throw new CDeckError(
       `file length mismatch: expected ${expectedFileLength}, actual ${actualLength}`,
     );
   }
-  const records = relativeRecords.map(
-    (record) => ({
-      ...record,
-      jpegOffset: payloadStart + record.jpegOffset,
-    }),
-  );
+  for (const record of records) {
+    record[OFFSET] += payloadStart;
+  }
   return {
     format: MAGIC,
     indexLength,
@@ -446,6 +314,20 @@ function collectionFromIndex(
     expectedFileLength,
     records,
   };
+}
+function attachReader(deck, read) {
+  deck.read = async (record, signal) => {
+    if (!deck.records.includes(record)) {
+      throw new CDeckError("record does not belong to deck");
+    }
+    if (record.length === 0) return new Uint8Array();
+    const bytes = bytesFrom(await read(record[OFFSET], record.length, signal));
+    if (bytes.byteLength !== record.length) {
+      throw new CDeckError(`payload read length mismatch: expected ${record.length}, actual ${bytes.byteLength}`);
+    }
+    return bytes;
+  };
+  return deck;
 }
 export async function openCdeck(source) {
   if (!source || typeof source.read !== "function") {
@@ -471,30 +353,33 @@ export async function openCdeck(source) {
   if (index.byteLength !== indexLength) {
     throw new CDeckError("truncated index");
   }
-  return collectionFromIndex(
+  const deck = collectionFromIndex(
     indexLength,
     index,
     source.size ?? null,
   );
+  return attachReader(
+    deck,
+    (start, length, signal) => source.read(start, length, signal),
+  );
 }
 export function parseCdeckBuffer(input) {
   const bytes = bytesFrom(input);
-  if (bytes.byteLength > MAX_FILE_BYTES) {
-    throw new CDeckError(
-      "file exceeds 32-bit size limit",
-    );
-  }
   const indexLength = readHeader(bytes);
   const payloadStart = HEADER_SIZE + indexLength;
   if (payloadStart > bytes.byteLength) {
     throw new CDeckError("truncated index");
   }
-  return collectionFromIndex(
+  const deck = collectionFromIndex(
     indexLength,
     bytes.subarray(
       HEADER_SIZE,
       payloadStart,
     ),
     bytes.byteLength,
+  );
+  return attachReader(
+    deck,
+    (start, length) => bytes.slice(start, start + length),
   );
 }

@@ -1,417 +1,595 @@
-# CDECK File Format 1
+# CDECK File Format 2
 
 ## Status
 
-This document specifies **CDECK File Format 1**.
+This document specifies **CDECK File Format 2**.
 
-Software release numbering is independent from file-format generation.
+Its wire-format generation identifier is:
 
-Published CDECK v1 and current V2 development both read and write:
+```text
+CDECK002
+```
 
-    CDECK File Format 1
-    magic = "CDECK001"
+CDECK software release numbering is independent from file-format generation.
+
+CDECK V3 reads and writes CDECK002.
+
+CDECK001 is the previous generation and is intentionally not part of the permanent V3 runtime reader. Migration is handled by the standalone `tools/cdeck001_to_002.py` utility.
 
 ## Purpose
 
-CDECK001 is a self-contained, read-oriented container for
-playing-card collections.
+CDECK002 is a deterministic, read-oriented, range-addressable container for application-defined metadata and arbitrary binary payloads.
 
-It stores:
+The core format defines:
 
-- structured deck metadata;
-- one JPEG payload per deck;
-- deterministic record order;
-- derived random-access JPEG addressing.
+- record identity;
+- application-defined metadata;
+- payload lengths and order;
+- deterministic index encoding;
+- derived payload addressing;
+- structural validation;
+- safe numeric bounds;
+- exact byte-source reads;
+- browser HTTP range transport.
 
-CDECK001 does not provide a database engine, transactions, mutation,
-compression, encryption, embedded checksums, thumbnails, arbitrary
-schemas, or generic asset types.
+The core format does not assign meaning to payload bytes or metadata keys.
+
+Media types, rendering, image decoding, DOM behavior, lazy-loading policy, Blob URL lifecycle, and domain-specific validation belong to applications.
 
 ## Binary Layout
 
-A CDECK001 file is:
+A CDECK002 file consists of:
 
-    12-byte header
-    UTF-8 JSON index
-    JPEG 0
-    JPEG 1
-    ...
-    JPEG N
+```text
+12-byte header
+UTF-8 JSON index
+payload 0
+payload 1
+...
+payload N
+```
 
-There is no footer, padding, checksum block, stored total file length,
-or stored JPEG offset.
+Payloads are contiguous and appear in record order.
 
-All multibyte binary integers are little-endian.
+There is no footer, padding, alignment block, payload table, stored payload offset, stored total length, embedded checksum block, MIME table, compression layer, or encryption layer.
+
+All multibyte binary integers in the header are little-endian.
 
 ## Header
 
 The header is exactly 12 bytes:
 
-    Offset  Size  Type       Field
-    0       8     byte[8]    magic
-    8       4     uint32 LE  indexLength
+```text
+Offset  Size  Type       Field
+0       8     byte[8]    magic
+8       4     uint32 LE  indexLength
+```
 
 Requirements:
 
-    magic == ASCII "CDECK001"
-    indexLength > 0
-    indexLength <= 2,000,000
-    payloadStart = 12 + indexLength
+```text
+magic == ASCII "CDECK002"
+indexLength > 0
+```
 
-Readers must reject unsupported format generations.
+The reference implementations apply a 16 MiB runtime guard:
+
+```text
+indexLength <= 16 * 1024 * 1024
+```
+
+This 16 MiB value is a reference runtime safety limit, not an expanded integer field in the wire format. The header field itself remains uint32 LE.
+
+Readers must reject unsupported CDECK generations.
 
 ## JSON Index
 
 The index occupies exactly:
 
-    bytes 12 through (12 + indexLength - 1)
+```text
+bytes 12 through (12 + indexLength - 1)
+```
 
-The index:
+The index must:
 
-- is UTF-8;
-- must not contain a UTF-8 BOM;
-- must reject malformed UTF-8;
-- must contain valid JSON;
-- has canonical top-level shape `{"decks":[]}`.
+- be UTF-8;
+- contain no UTF-8 BOM;
+- decode without malformed UTF-8;
+- contain valid JSON;
+- have a top-level JSON array;
+- contain at most 4,000 records.
 
-Maximum record count:
+Property order is not significant for structural validity.
 
-    4,000
+Canonical encoding imposes a deterministic property order described later in this specification.
 
-Maximum encoded index size:
+## Record Shape
 
-    2,000,000 UTF-8 bytes
+Every record must be a JSON object containing exactly:
 
-Canonical writer output must be compact and deterministic.
+```json
+{
+  "id": "asset-001",
+  "length": 123,
+  "meta": {}
+}
+```
 
-Reference tooling distinguishes structural validity from canonical encoding. A structurally valid `CDECK001` file may use a different JSON byte representation and still be readable. Canonical verification reconstructs the official semantic index, applies the deterministic writer encoding, and compares the resulting bytes exactly with the stored index.
+The required core members are:
 
-Readers must not depend on JSON property order.
+```text
+id
+length
+meta
+```
 
-## Canonical Deck Record
+No other top-level record member is permitted.
 
-Every canonical record contains:
+Application-specific values belong inside `meta`.
 
-    {
-      "id": "deck-id",
-      "name": "Deck Name",
-      "quantity": 1,
-      "brand": "Brand",
-      "printer": "Printer",
-      "jpegLength": 123456
-    }
+## id
 
-Canonical CDECK001 records do not contain:
+`id` must:
 
-    src
-    jpegOffset
-    mime
-    width
-    height
-    checksum
-    thumbnail
-
-## Field Requirements
-
-### id
-
-- JSON string
-- non-empty
-- unique within the file
-- at most 500 UTF-8 bytes
-
-### name
-
-- JSON string
-- at most 1,000 UTF-8 bytes
-
-### quantity
-
-- JSON integer
-- `1 <= quantity <= 10,000`
-
-### brand
-
-- JSON string
-- at most 500 UTF-8 bytes
-- empty string is valid
-
-### printer
-
-- JSON string
-- at most 500 UTF-8 bytes
-- empty string is valid
-
-### jpegLength
-
-- JSON integer
-- greater than zero
-- at most `0xffffffff`
-
-No Unicode normalization form is imposed.
+- be a JSON string;
+- be non-empty;
+- contain no lone Unicode surrogate;
+- be unique within the archive.
 
 ID equality uses the decoded JSON string value.
 
-## Reference CSV ID Derivation
+CDECK002 does not impose an application naming convention on IDs.
 
-For the reference CSV source model:
+## length
 
-    id = filename stem of src
+`length` is the exact payload length in bytes.
 
-Example:
+It must be a non-negative integer in the JavaScript safe-integer range:
 
-    images/deck_188_1ST_v1.jpg
-    ->
-    deck_188_1ST_v1
+```text
+0 <= length <= 9007199254740991
+```
 
-The source CSV row order is preserved.
+Boolean values are not integers for this purpose.
 
-Records are not sorted by ID or numeric filename prefix.
+A zero-length payload is valid.
 
-## JPEG Addressing
+## meta
 
-JPEG offsets are derived rather than stored.
+`meta` must be a JSON object.
 
-For record `i`:
+It may contain arbitrary application-defined keys and nested values that satisfy the CDECK002 JSON value profile.
 
-    relativeOffset[0] = 0
+The core preserves metadata but does not interpret its meaning.
 
-    relativeOffset[i] =
-        sum(decks[j].jpegLength for j < i)
+Unknown metadata keys are valid.
 
-    absoluteOffset[i] =
-        payloadStart + relativeOffset[i]
+## JSON Value Profile
 
-Expected total file length:
+Values inside `meta`, and strings used by the core, are restricted to a deterministic cross-runtime subset of JSON.
 
-    expectedFileLength =
-        12 + indexLength + sum(decks[*].jpegLength)
+Allowed values are:
 
-Requirement:
+- null;
+- booleans;
+- integers from `-9007199254740991` through `9007199254740991`;
+- strings without lone Unicode surrogates;
+- arrays containing allowed values;
+- objects with string keys and allowed values.
 
-    expectedFileLength <= 0xffffffff
+Floating-point JSON numbers are not allowed.
 
-JavaScript `Number` is sufficient for CDECK001.
+NaN and Infinity are not valid JSON and are rejected.
 
-`BigInt` is not required.
-
-## JPEG Payload Rules
-
-JPEG payloads must:
-
-- appear in record order;
-- be contiguous;
-- contain no gaps;
-- contain no padding;
-- contain exactly `jpegLength` bytes for their record;
-- be copied unchanged from the source JPEG.
-
-CDECK treats JPEG bytes as opaque payload data.
-
-CDECK does not decode, transcode, recompress, normalize, or otherwise
-rewrite JPEG internals.
-
-The reference builder resolves each source JPEG path within the CSV source directory before reading it. Paths that resolve outside that directory, including escaping symlinks, are rejected. Symlinks that resolve inside the source directory are permitted.
-
-The reference builder also requires each source JPEG to begin with the JPEG SOI bytes `FF D8`. This is a builder sanity check; accepted JPEG bytes are still copied byte-for-byte without decoding or rewriting them.
-
-## Complete File Length
-
-If the complete representation length is available, it must equal:
-
-    12 + indexLength + sum(jpegLength)
-
-A mismatch makes the CDECK file invalid.
-
-## Unknown JSON Members
-
-Canonical writers:
-
-- emit every required member;
-- do not emit duplicate member names;
-- do not emit undefined members.
-
-Canonical source builders reject unexpected source fields.
-
-Browser readers:
-
-- validate every required recognized member;
-- ignore unknown top-level members;
-- ignore unknown record members;
-- reject missing required members;
-- reject invalid recognized values.
-
-Verifiers:
-
-- validate required members;
-- reject duplicate JSON member names;
-- should warn about unknown members.
+All object keys are themselves subject to the string rules.
 
 ## Duplicate JSON Members
 
-Canonical writers must never emit duplicate JSON object member names.
+Conforming CDECK002 JSON objects must not contain duplicate member names.
 
-The reference Python verifier must reject duplicate member names.
+The reference Python parser detects and rejects duplicate JSON members.
 
-Browser readers may use native `JSON.parse()` and are not required to
-implement a custom duplicate-key tokenizer.
+The browser implementation uses native `JSON.parse()`. Native parsing does not expose duplicate-member information after parsing, so the browser reader cannot reliably detect this condition.
 
-Duplicate-key files remain non-conforming.
+A file containing duplicate JSON members remains non-conforming even when an implementation cannot detect the violation.
 
-## Exact Read Contract
+## Payload Addressing
+
+Payload offsets are derived and are not stored.
+
+Define:
+
+```text
+payloadStart = 12 + indexLength
+```
+
+For record `i`:
+
+```text
+relativeOffset[0] = 0
+
+relativeOffset[i] =
+    sum(record[j].length for j < i)
+
+absoluteOffset[i] =
+    payloadStart + relativeOffset[i]
+```
+
+The cumulative payload length must remain within the JavaScript safe-integer range.
+
+The complete derived file length is:
+
+```text
+expectedFileLength =
+    payloadStart + sum(record[*].length)
+```
+
+`expectedFileLength` must also be a safe integer.
+
+When the complete representation length is known, it must equal `expectedFileLength` exactly.
+
+Trailing bytes and truncated payloads therefore make the archive invalid.
+
+## Payload Rules
+
+Payload bytes:
+
+- appear in record order;
+- are contiguous;
+- contain no gaps or padding;
+- contain exactly `length` bytes for each record;
+- are opaque to the CDECK core.
+
+The core does not decode, normalize, transcode, recompress, or otherwise rewrite payload contents.
+
+## Numeric Model
+
+CDECK002 deliberately uses the JavaScript safe-integer model rather than BigInt or uint64 fields.
+
+The maximum supported integer is:
+
+```text
+9007199254740991
+```
+
+This applies to record lengths, cumulative payload lengths, derived addresses, derived file length, and HTTP range arithmetic.
+
+Values at and above 2^32 are valid when they remain safe integers.
+
+The value 2^53 is not valid.
+
+## Canonical Encoding
+
+Structural validity and canonical encoding are separate concepts.
+
+A structurally valid CDECK002 archive may contain a semantically equivalent noncanonical JSON representation.
+
+The reference canonical encoder uses the semantic equivalent of:
+
+```python
+json.dumps(
+    records,
+    ensure_ascii=False,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+).encode("utf-8")
+```
+
+Therefore canonical index output:
+
+- is UTF-8 without BOM;
+- contains no insignificant whitespace;
+- recursively sorts object keys;
+- emits non-ASCII Unicode directly when JSON escaping is not otherwise required;
+- uses deterministic JSON string escaping;
+- contains no floating-point numbers;
+- contains no duplicate object members.
+
+Canonical key ordering follows the reference Unicode string ordering used by the canonical encoder.
+
+`python3 cdeck.py verify FILE --canonical` reconstructs the semantic index, re-encodes it canonically, and requires byte-for-byte equality with the stored index.
+
+## Builder Manifest
+
+The reference builder consumes a UTF-8 JSON manifest whose top level is an array.
+
+Each manifest entry contains exactly:
+
+```json
+{
+  "id": "asset-001",
+  "path": "payloads/example.bin",
+  "meta": {}
+}
+```
+
+`path` is builder-only input and is not written to the CDECK002 record.
+
+Manifest rules:
+
+- no more than 4,000 entries;
+- exact entry shape `{id,path,meta}`;
+- `id` follows normal record ID rules;
+- `meta` follows the normal metadata profile;
+- `path` is a non-empty string;
+- absolute payload paths are rejected;
+- paths containing a `..` component are rejected;
+- resolved payload files must remain inside the manifest directory;
+- symlinks resolving inside that directory are allowed;
+- symlinks escaping that directory are rejected;
+- each resolved payload must be a regular file.
+
+Payload length is derived from the source file size.
+
+Manifest order becomes record and payload order.
+
+The builder does not infer IDs, media types, or metadata from filenames.
+
+## Reference Build Semantics
+
+The reference builder:
+
+- validates the manifest;
+- derives record lengths from source payload files;
+- canonicalizes the index;
+- copies payload bytes unchanged;
+- writes through a temporary file in the destination directory;
+- flushes and fsyncs the completed temporary output;
+- verifies the generated archive against the source manifest and payloads;
+- atomically replaces the requested destination.
+
+The output path must not replace the manifest or any source payload.
+
+Equivalent source inputs produce byte-identical output.
+
+## Source Verification
+
+Source-aware verification rebuilds the expected record model from the manifest.
+
+For each record it requires:
+
+- exact equality between the derived source record and archive record;
+- SHA-256 equality between the source payload and embedded payload slice.
+
+SHA-256 is used by verification tooling only.
+
+CDECK002 does not store payload checksums in the wire format.
+
+## Inspection
+
+Inspection tooling may expose derived information that is not present on the wire.
+
+The reference Python inspector adds an absolute `offset` field to its inspection result.
+
+`offset` is not a CDECK002 record member and must not be serialized into the index.
+
+## Byte Source Contract
 
 A byte source conceptually provides:
 
-    read(start, length)
+```text
+read(start, length, signal?)
+```
 
-and returns exactly the requested bytes or fails.
+`start` must be a non-negative safe integer.
 
-The reference HTTP source additionally accepts an optional abort signal:
+`length` must be a positive safe integer.
 
-    read(start, length, signal?)
+`start + length` must remain a safe integer.
 
-Cancellation does not change the exact-read contract.
+A successful non-zero read returns exactly `length` bytes.
 
-Reference remote parsing proceeds as:
+The optional `signal` is used for cancellation by sources that support it.
 
-    read(0, 12)
-    validate header
-    read(12, indexLength)
-    fatal UTF-8 decode
-    parse JSON
-    validate index
-    derive JPEG offsets
-    render metadata
-    retrieve JPEG ranges lazily
+## Browser Open Contract
 
-A fixed 64 KiB initial prefix is not part of CDECK001.
+`openCdeck(source)` requires an object providing `read(start, length)`.
 
-## HTTP Range Behavior
+Opening proceeds as:
 
-For HTTP range reads:
+```text
+read(0, 12)
+validate header
+read(12, indexLength)
+decode and validate index
+derive payload addresses
+validate complete size when source.size is known
+```
 
-    Range: bytes=start-(start + length - 1)
+Opening does not read payload bytes.
+
+The returned deck exposes public records containing only:
+
+```text
+id
+length
+meta
+```
+
+Payload offsets are private implementation state.
+
+`deck.read(record, signal)` accepts only a record object belonging to that deck.
+
+For a non-empty record, it requests exactly the derived payload range and verifies the returned byte length.
+
+For a zero-length record, it returns an empty byte array without calling the underlying source.
+
+## Buffered Parsing
+
+`parseCdeckBuffer(input)` accepts an ArrayBuffer or typed-array view.
+
+Typed-array byte offsets and byte lengths are respected.
+
+The complete input representation length must exactly equal the length derived from the index.
+
+Payload reads are served from local slices.
+
+## HTTP Source
+
+`createHttpSource(url, options)` implements an exact-read source using HTTP GET requests.
+
+It does not require a preliminary HEAD request.
+
+For each uncached request it sends:
+
+```text
+Range: bytes=start-(start + length - 1)
+```
+
+Only HTTP status 200 and 206 are accepted.
+
+## HTTP 206 Behavior
 
 For `206 Partial Content`:
 
-- body length must equal the requested length;
-- visible `Content-Range` should be validated;
-- numeric complete-size observations must agree with each other;
-- visible complete size must agree with the derived expected file length.
+- the body must contain exactly the requested number of bytes;
+- a visible `Content-Range` must syntactically describe the requested range;
+- a numeric complete-size value must be a safe integer;
+- the requested end must not exceed the numeric complete size;
+- repeated numeric complete-size observations must agree.
 
-For representation identity:
+A missing `Content-Range`, or a total represented as `*`, leaves complete source size unknown.
 
-- the first visible strong ETag locks the reference HTTP source snapshot;
-- later network responses must present the same strong ETag once locked;
-- weak ETags do not establish byte identity;
-- a source without a visible strong ETag remains usable but has no hard snapshot guarantee.
+## HTTP Representation Identity
 
-If a Range request receives `200 OK`:
+The first visible strong ETag establishes the reference HTTP source snapshot identity.
 
-- treat Range as unsupported or ignored;
-- receive the complete response before installing the cache;
-- record the complete body length as the source size;
-- validate its length after parsing the index;
-- satisfy later exact reads from local slices.
+After a strong ETag is locked, later network responses must present that same strong ETag.
 
-A preliminary `HEAD` request is not required.
+Weak ETags do not establish byte identity.
 
-Range support is an optimization, not a correctness requirement.
+A source without a visible strong ETag remains usable but does not receive the same hard snapshot guarantee.
 
-## Lazy JPEG Retrieval
+## HTTP 200 Fallback
 
-The browser implementation uses one `IntersectionObserver`.
+A server may ignore Range and return `200 OK` with the complete representation.
 
-Deck metadata may be rendered before image payload retrieval.
+The reference source supports this as a bounded fallback.
 
-When a deck approaches the viewport:
+The default maximum full response is:
 
-    derived JPEG range
-    -> exact read
-    -> Blob(type="image/jpeg")
-    -> URL.createObjectURL()
-    -> <img>.src
+```text
+64 * 1024 * 1024 bytes
+```
 
-Duplicate concurrent retrieval of the same image must be prevented.
+This may be changed with `maxFullBytes`.
 
-Blob URLs must be revoked when no longer needed.
+If `Content-Length` is present on a 200 response:
 
-The reference lazy loader also provides:
+- it must be a non-negative safe integer;
+- it must not exceed `maxFullBytes`.
 
-    onError(error, target, record)
-    retry(target)
+The declared bound is checked before buffering the body.
 
-`onError` is optional. Retry is explicit; there is no automatic retry, backoff, or request queue. Failed non-abort loads clear their in-flight state before the error callback runs, allowing a later retry to start a fresh request.
+After buffering:
 
-Each active lazy load owns an abort controller. `release(target)` aborts an outstanding request and prevents a late result from being installed. `disconnect()` stops observation and aborts all active loads. Expected aborts are cleanup and do not invoke the ordinary error callback.
+- actual body length must not exceed `maxFullBytes`;
+- actual body length becomes the known source size;
+- any previously observed source size must agree;
+- later reads are satisfied from the cached complete body without another fetch.
+
+A requested slice extending past the complete body is rejected.
+
+## Network Errors and Cancellation
+
+HTTP and network failures are surfaced as CDECK errors.
+
+An underlying AbortError is preserved rather than wrapped as a generic network failure.
 
 ## Validation Requirements
 
-Treat CDECK files as untrusted input.
+CDECK files must be treated as untrusted input.
 
-Reject at minimum:
+Reference implementations reject at minimum:
 
-- header shorter than 12 bytes;
+- headers shorter than 12 bytes;
 - wrong magic;
-- unsupported generation;
-- zero `indexLength`;
-- `indexLength` above 2,000,000;
-- truncated index;
+- unsupported CDECK generations;
+- zero indexLength;
+- indexLength beyond the 16 MiB runtime guard;
+- truncated indexes;
+- UTF-8 BOM;
 - malformed UTF-8;
 - invalid JSON;
-- invalid top-level shape;
-- non-array `decks`;
+- non-array top-level indexes;
 - more than 4,000 records;
-- missing required members;
-- recognized members with wrong types;
-- over-limit UTF-8 strings;
-- invalid `quantity`;
-- invalid `jpegLength`;
+- non-object records;
+- missing core members;
+- unexpected core members;
+- empty or non-string IDs;
 - duplicate IDs;
-- cumulative size above `0xffffffff`;
-- complete size mismatch when known;
-- short HTTP range response;
-- impossible ranges;
-- changed strong ETag after snapshot identity is locked;
-- conflicting numeric complete-size observations;
-- HTTP or network failure.
+- invalid lengths;
+- non-object meta values;
+- forbidden JSON values;
+- cumulative payload length beyond safe-integer range;
+- derived file length beyond safe-integer range;
+- complete representation length mismatch when known;
+- short payload reads;
+- invalid HTTP ranges;
+- inconsistent source sizes;
+- changed locked strong ETags;
+- unsupported HTTP status codes;
+- network failures.
 
-Attacker-controlled values must be bounds-checked before they drive
-allocation or slicing.
+Bounds must be checked before attacker-controlled values drive range arithmetic, allocation, or slicing.
 
-Metadata inserted into HTML must use safe text/property APIs rather
-than untrusted `innerHTML`.
+## Shared Conformance Vectors
 
-## Integrity Verification
+The repository contains the shared CDECK002 conformance corpus in:
 
-CDECK001 contains no embedded checksum.
+```text
+tests/vectors/
+```
 
-Source-aware verification compares, for every deck:
+`tests/vectors/vectors.json` defines expected structural results consumed by both Python and JavaScript tests.
 
-    SHA-256(source JPEG)
-    ==
-    SHA-256(embedded JPEG slice)
+The corpus includes canonical and noncanonical valid archives, malformed framing, malformed UTF-8 and JSON, record-shape failures, metadata-profile failures, numeric boundary failures, zero-length payloads, overflow, truncation, trailing bytes, and a known CDECK001 migration result.
 
-It also verifies exact preservation of:
+The vector generator must reproduce committed vector bytes deterministically.
 
-    name
-    quantity
-    brand
-    printer
+## CDECK001 Migration
+
+CDECK001 compatibility is intentionally isolated from the CDECK002 runtime core.
+
+The standalone migrator:
+
+```text
+tools/cdeck001_to_002.py
+```
+
+validates a legacy CDECK001 archive, maps legacy card metadata into the CDECK002 `meta` object, preserves record order, preserves payload order, copies payload bytes unchanged, and emits canonical CDECK002.
+
+The migration tool is not part of the CDECK002 wire format.
 
 ## Deterministic Output
 
-Equivalent source inputs should produce byte-identical CDECK output.
+Canonical generation preserves:
 
-Canonical generation therefore preserves:
-
-- CSV row order;
-- deterministic filename-stem IDs;
-- stable JSON member order;
+- manifest record order;
+- exact payload bytes;
+- deterministic recursive JSON key order;
 - compact JSON separators;
 - UTF-8 without BOM;
-- unchanged JPEG bytes;
 - no timestamps;
 - no filesystem metadata;
 - no randomness;
 - no compression.
+
+## Non-Goals
+
+CDECK002 does not define:
+
+- database transactions;
+- in-place mutation;
+- compression;
+- encryption;
+- embedded payload checksums;
+- stored payload offsets;
+- MIME inference;
+- media decoding;
+- application rendering;
+- application metadata schemas;
+- backend services.
+
+These are application or deployment concerns, not core format responsibilities.

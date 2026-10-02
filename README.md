@@ -1,337 +1,349 @@
 # CDECK
 
-CDECK is a small binary container format I built because I wanted a cleaner way to serve my personal playing-card collection online.
+CDECK is a small, deterministic container format for bundling metadata and binary assets into one range-addressable file.
 
-Originally, the collection was made up of a metadata file plus hundreds of separate JPEGs. That worked fine, but it always bothered me that such a simple, read-only collection needed so many individual files sitting on the server.
+I originally built it for my personal playing-card collection. That site used a metadata file plus hundreds of separate JPEGs, and I wanted a cleaner deployment without adding a database or backend.
 
-I kept thinking there had to be a simpler way.
+The original use case is still what motivated CDECK, but the format itself is now generic. The core does not know what an asset means, what media type it contains, or how an application should render it.
 
-So I made one.
-
-Instead of deploying metadata alongside a pile of loose images, CDECK rolls the whole collection into a single file:
-
-```text
-collection.cdeck
-```
-
-The browser reads a small index first, figures out where each image lives inside the file, and then pulls individual JPEGs only when they're actually needed.
-
-That's CDECK.
-
-It isn't trying to be a database, an archive format, or a giant framework. It's just a small format that solves a problem I personally had.
-
-## Why I Built It
-
-The original version of my collection site was pretty straightforward:
-
-```text
-metadata file
-+
-hundreds of JPEGs
-```
-
-There was nothing especially wrong with that setup. It worked.
-
-But I wanted the deployment to feel tighter.
-
-I wanted one collection file instead of hundreds of individual collection assets. I wanted to keep using a normal static web server. I didn't want a backend, a database, a service worker, or some big dependency stack just to display a card collection.
-
-I also didn't want to sacrifice lazy loading. There was no reason the browser should download every image up front just because everything lived in one file.
-
-That led to the basic idea behind CDECK:
-
-> Put the metadata and images into one deterministic file, keep a tiny index at the front, and use HTTP Range requests to grab images only when the browser needs them.
-
-Once I realized that was enough, I tried pretty hard not to make it more complicated than it needed to be.
-
-## What It Looks Like
-
-A CDECK file is basically:
+A CDECK file contains:
 
 ```text
 12-byte header
-JSON index
-JPEG
-JPEG
-JPEG
-JPEG
+UTF-8 JSON index
+payload 0
+payload 1
 ...
+payload N
 ```
 
-That's it.
+The browser can read the small header and index first, derive the byte location of every payload, and request individual payload ranges only when the application needs them.
 
-The header identifies the format and tells the reader how large the JSON index is.
+CDECK is not trying to be a database, archive suite, media framework, or package ecosystem. It is intentionally small.
 
-The index contains the metadata for each record and the length of its JPEG.
+## Why I Built It
 
-Because the JPEGs are stored back-to-back, the reader doesn't need to store an offset for every image. It can calculate them.
-
-The current file format is:
+The original Cardeckatcher deployment looked roughly like this:
 
 ```text
-CDECK001
+metadata
++
+hundreds of images
 ```
 
-The published software release is:
+That worked, but I wanted one portable collection file while keeping ordinary static hosting and lazy access to individual assets.
+
+That led to the central idea:
+
+> Put metadata and payloads into one deterministic file, keep a compact index at the front, and use byte ranges to retrieve only what the application needs.
+
+CDECK V3 generalizes that idea beyond playing cards. Card-specific schema, image rendering, JPEG assumptions, lazy image loading, Blob URL management, and other application behavior belong outside the core.
+
+## Current Format
+
+The current wire format is:
 
 ```text
-v1
+CDECK002
 ```
 
-Current V2 development still reads and writes `CDECK001`. Software release numbering and file-format generation are intentionally separate.
+CDECK software uses whole-number releases such as `v1`, `v2`, and `v3`. Software release numbers and file-format generations are separate.
 
-## What Goes in a Record?
+CDECK V3 reads and writes `CDECK002`.
 
-A record looks like this:
+`CDECK001` is the previous generation. V3 intentionally does not keep permanent CDECK001 parsing inside the browser/runtime core. A standalone migration tool is provided instead.
+
+## Record Model
+
+The CDECK002 index is a top-level JSON array.
+
+Every record has exactly three core members:
 
 ```json
 {
-  "id": "deck_example",
-  "name": "Example Deck",
-  "quantity": 1,
-  "brand": "Example Brand",
-  "printer": "Example Printer",
-  "jpegLength": 123456
+  "id": "asset-001",
+  "length": 123456,
+  "meta": {
+    "name": "Example"
+  }
 }
 ```
 
-The actual JPEG bytes aren't stored inside the JSON. They live in the payload section after the index.
+`id` identifies the record.
 
-The JSON just contains enough information for the reader to validate the record and find the image.
+`length` is the exact payload length in bytes.
+
+`meta` is an application-defined JSON object. CDECK validates its JSON value profile but does not assign domain meaning to its keys.
+
+Payload offsets are not stored. They are derived from the header, encoded index length, record order, and preceding record lengths.
+
+Zero-length payloads are valid.
 
 ## Building a CDECK File
 
-The Python tool can build a collection from a CSV and the JPEG files it references.
+The Python builder consumes a JSON manifest.
+
+Example:
+
+```json
+[
+  {
+    "id": "asset-001",
+    "path": "payloads/example.bin",
+    "meta": {
+      "name": "Example"
+    }
+  }
+]
+```
+
+`path` is builder input only. It is not stored as a core record member.
+
+Build with:
 
 ```bash
-python3 cdeck.py build decks.csv collection.cdeck
+python3 cdeck.py build manifest.json collection.cdeck
 ```
 
-The CSV format used by v1 is:
+Payload files may contain arbitrary binary data.
 
-```text
-src,name,quantity,brand,printer
-```
+The builder keeps manifest order, copies payload bytes unchanged, rejects unsafe paths that escape the manifest source directory, permits symlinks that still resolve inside that directory, validates the generated archive, and replaces the destination atomically.
 
-The builder validates the input, builds the file, verifies it, and then replaces the destination atomically.
+Equivalent inputs produce byte-identical canonical output.
 
-Before reading a source JPEG, the builder resolves its path inside the CSV source directory, rejects paths that escape that directory, and requires the file to begin with the JPEG SOI bytes `FF D8`. Symlinks that resolve inside the source directory are allowed; escaping symlinks are rejected. Accepted JPEG bytes are copied unchanged.
+## Inspecting a CDECK File
 
-One thing I cared about from the beginning was deterministic output.
-
-If the source data hasn't changed, rebuilding the collection should produce the exact same bytes.
-
-## Inspecting One
-
-You can inspect a CDECK file from the command line:
+Inspect an archive:
 
 ```bash
 python3 cdeck.py inspect collection.cdeck
 ```
 
-Or limit how many records it prints:
+Limit displayed records:
 
 ```bash
 python3 cdeck.py inspect collection.cdeck --limit 10
 ```
 
-For machine-readable inspection:
+Inspect one record by ID:
+
+```bash
+python3 cdeck.py inspect collection.cdeck --id asset-001
+```
+
+Emit machine-readable JSON:
 
 ```bash
 python3 cdeck.py inspect collection.cdeck --json
 ```
 
-To select one record by exact ID:
+## Verifying a CDECK File
 
-```bash
-python3 cdeck.py inspect collection.cdeck --id deck_example
-```
-
-`--json` keeps stdout machine-readable, while diagnostics continue to use stderr.
-
-This is mostly there because I wanted an easy way to look inside the format without writing another tool every time I was debugging something.
-
-## Verifying One
-
-Basic verification:
+Structural verification:
 
 ```bash
 python3 cdeck.py verify collection.cdeck
 ```
 
-Source-aware verification:
-
-```bash
-python3 cdeck.py verify collection.cdeck --source decks.csv
-```
-
-For silent successful validation:
+Silent successful verification:
 
 ```bash
 python3 cdeck.py verify collection.cdeck --quiet
 ```
 
-For exact canonical-index verification:
+Canonical byte-profile verification:
 
 ```bash
 python3 cdeck.py verify collection.cdeck --canonical
 ```
 
-Ordinary validity and canonical encoding are intentionally different checks. A reader can accept structurally valid `CDECK001` that uses noncanonical JSON encoding, while `--canonical` requires the index bytes to match the deterministic writer encoding exactly.
+Structural validity and canonical encoding are intentionally separate.
 
-When the original source files are available, CDECK can compare every embedded JPEG against the original using SHA-256.
+A structurally valid CDECK002 index may use a noncanonical JSON byte representation. `--canonical` reconstructs the semantic index using the deterministic CDECK profile and requires the stored index bytes to match exactly.
 
-That was important to me because I wanted the format to copy the JPEGs exactly as they were, not silently recompress or alter them.
+When the original manifest and payload files are available, source-aware verification can also compare the archive against its source inputs:
 
-CDECK itself does not store checksums inside the file. Verification belongs in the tooling rather than the format.
+```bash
+python3 cdeck.py verify collection.cdeck --source manifest.json
+```
 
-## Using It in the Browser
+CDECK does not embed payload checksums in the wire format.
 
-The browser-side code lives in `cdeck.js`.
+## Browser API
 
-A basic setup looks like this:
+The public JavaScript surface is intentionally small:
+
+```javascript
+CDeckError
+createHttpSource(url, options)
+openCdeck(source)
+parseCdeckBuffer(buffer)
+```
+
+A normal remote setup looks like:
 
 ```javascript
 import {
   createHttpSource,
-  createLazyImageLoader,
   openCdeck,
 } from "./cdeck.js";
 
 const source = createHttpSource("collection.cdeck");
-const collection = await openCdeck(source);
+const deck = await openCdeck(source);
+
+const record = deck.records[0];
+const bytes = await deck.read(record);
 ```
 
-The HTTP source tracks representation identity and size when the server exposes them. The first visible strong ETag locks the source snapshot, while weak ETags do not. Numeric `Content-Range` totals must stay consistent, and once the complete source size is known it must equal the file length derived from the CDECK index.
+`deck.records` exposes public records containing `id`, `length`, and `meta`.
 
-A server without a visible strong validator still works; it simply does not provide the same hard snapshot guarantee. CDECK does not add a preliminary `HEAD` request.
+Physical offsets remain private implementation details.
 
-The reader starts by requesting just the 12-byte header.
+`deck.read(record, signal)` retrieves exactly that record payload. A zero-length record returns an empty byte array without issuing a source read.
 
-Then it requests the JSON index.
-
-After that, it knows everything it needs to know about the collection without downloading the image payloads.
-
-Images can then be loaded individually as they come into view.
-
-## Lazy Loading
-
-This was one of the parts I didn't want to lose when moving everything into one file.
-
-CDECK uses `IntersectionObserver` so images can still load on demand.
-
-When an image gets close to the viewport, the reader calculates its byte range, requests those bytes, creates an `image/jpeg` Blob, and gives the resulting object URL to the image element.
-
-The lazy loader also supports an optional `onError(error, target, record)` callback and explicit `retry(target)`. Releasing a target aborts its outstanding request and prevents a late result from being installed. Disconnecting the loader stops observation and aborts all active loads. Expected aborts are treated as cleanup rather than ordinary load errors.
-
-So even though the collection is physically stored as one file, the browser doesn't have to treat it like one giant download.
+`parseCdeckBuffer()` provides the same deck/read model for an already-buffered local representation.
 
 ## HTTP Range Requests
 
-CDECK works best when the server supports byte ranges.
+`createHttpSource()` is designed for ordinary static HTTP hosting.
 
-A request might look like:
+The reader first requests the 12-byte header, then the JSON index. Payloads can then be retrieved independently.
 
-```text
-Range: bytes=123456-234567
-```
-
-And a static server can return just that part of the file with:
+A payload request uses a normal HTTP byte range:
 
 ```text
-206 Partial Content
+Range: bytes=start-end
 ```
 
-But I didn't want CDECK to completely fall apart on a server that ignores Range requests.
+With `206 Partial Content`, CDECK validates exact response length and visible `Content-Range` information.
 
-If the server responds with the entire file using `200 OK`, the reader receives and validates the complete body before caching it, records that body length as the source size, and satisfies later reads from local slices.
+Numeric total-size observations must remain consistent. A visible strong ETag locks representation identity for later network reads; weak ETags do not establish that guarantee.
 
-So Range support is an optimization, not a hard requirement.
+No preliminary `HEAD` request is required.
+
+If a server ignores Range and returns `200 OK`, the complete representation may be buffered and cached instead. The default full-response ceiling is 64 MiB and can be changed with `maxFullBytes`.
+
+```javascript
+const source = createHttpSource("collection.cdeck", {
+  maxFullBytes: 64 * 1024 * 1024,
+});
+```
+
+This makes byte-range support an optimization rather than a correctness requirement for reasonably sized archives.
 
 ## Hosting
 
 A normal static web server is enough.
 
-The recommended content type is:
+Recommended content type:
 
 ```text
 application/octet-stream
 ```
 
-The important thing is that the `.cdeck` file is served as-is.
+The `.cdeck` representation should be served without transparent transformation because byte addressing refers to the stored representation.
 
-The server should not transparently compress or transform it, because the browser is reading specific byte positions from the stored representation.
+Servers with byte-range support provide the most efficient behavior.
 
-No special backend is required.
+## CDECK001 Migration
 
-## What CDECK Doesn't Try to Be
+V3 includes a standalone converter for previous-generation archives:
 
-I deliberately left a lot of things out.
+```bash
+python3 tools/cdeck001_to_002.py old.cdeck new.cdeck
+```
 
-There is no:
+The converter validates CDECK001 input, maps the legacy card fields into CDECK002 `meta`, preserves record and payload order, copies payload bytes unchanged, and writes canonical CDECK002 output.
 
-- SQL
-- query language
-- transaction system
-- journaling
-- database engine
-- compression
-- encryption
-- signature system
-- service worker
-- IndexedDB cache
-- SQLite
-- WebAssembly
-- thumbnail system
-- arbitrary asset support
-- plugin system
+Keeping migration outside the runtime allows the CDECK002 core to remain clean and generic.
 
-That's intentional.
+## Canonical Encoding
 
-I didn't want to build a general-purpose container format and then spend the rest of the project maintaining features I never needed.
+CDECK002 uses a deliberately small deterministic JSON profile rather than a full external canonicalization standard.
 
-CDECK is supposed to stay small enough that I can come back to it months later, read the code, and understand what it's doing without having to reconstruct an entire architecture in my head.
+Canonical writer output uses compact UTF-8 JSON without a BOM, deterministic recursive object-key ordering, and no insignificant whitespace.
 
-## The Format
+The supported metadata value profile includes objects, arrays, strings, booleans, null, and safe integers.
 
-The file starts with a 12-byte header:
+Floating-point JSON numbers are not part of the CDECK002 metadata profile.
+
+Integers and derived byte addresses must remain within JavaScript safe-integer range:
+
+```text
+0 .. 9007199254740991
+```
+
+## Format Layout
+
+The header is exactly 12 bytes:
 
 ```text
 Offset  Size  Field
-0       8     CDECK001
+0       8     ASCII CDECK002
 8       4     indexLength, little-endian uint32
 ```
 
-After that comes the UTF-8 JSON index.
+The UTF-8 JSON index starts at byte 12.
 
-Then the JPEG payloads follow one after another in record order.
+Raw payloads follow immediately after the index, contiguously and in record order.
 
-There is no footer.
+There is no footer, payload table, stored payload offset, padding, alignment block, compression layer, checksum block, or MIME table.
 
-There is no padding between images.
+The exact normative rules are in [`SPEC.md`](SPEC.md).
 
-There are no stored JPEG offsets.
+## Shared Conformance Vectors
 
-There is no stored total file size.
+The repository includes a deterministic CDECK002 conformance corpus under:
 
-The reader derives all of that from the header and `jpegLength` values.
+```text
+tests/vectors/
+```
 
-If you want the exact rules and validation requirements, see [`SPEC.md`](SPEC.md).
+`tests/vectors/vectors.json` is consumed by both the Python and JavaScript test suites.
 
-## A Few Things I Care About
+The corpus covers valid canonical and noncanonical archives plus malformed framing, UTF-8, JSON, record shape, metadata, safe-integer, overflow, truncation, trailing-byte, zero-length, and migration cases.
 
-CDECK is built around a few simple rules:
+The vector generator is deterministic, and the tests verify that regeneration produces identical bytes.
 
-- same input should produce the same output
-- original JPEG bytes should stay unchanged
-- metadata should survive exactly
-- malformed files should fail cleanly
-- browsers shouldn't need to download every image up front
-- static hosting should be enough
-- the implementation should stay small
-- the format should be understandable without specialized tooling
+## Design Boundaries
 
-Those constraints matter more to me than adding features for the sake of having them.
+The CDECK core owns:
+
+- deterministic encoding
+- record identity
+- opaque application metadata
+- payload lengths and order
+- derived addressing
+- structural and canonical validation
+- numeric bounds
+- HTTP range transport
+- representation consistency
+- the minimal browser read API
+
+Applications own:
+
+- metadata meaning
+- media types
+- image or document decoding
+- rendering and DOM behavior
+- lazy-loading policy
+- Blob URL lifecycle
+- application-specific validation
+
+## Things CDECK Deliberately Does Not Add
+
+- a database engine
+- transactions
+- in-place mutation
+- compression
+- encryption
+- embedded payload checksums
+- stored offsets
+- MIME inference
+- application schema rules
+- a backend service
+
+Those omissions are intentional.
 
 ## Repository Layout
 
@@ -339,42 +351,33 @@ Those constraints matter more to me than adding features for the sake of having 
 cdeck.py
 cdeck.js
 SPEC.md
+tools/
 tests/
+tests/vectors/
 .github/workflows/ci.yml
 ```
 
-`cdeck.py` contains the builder, verifier, and inspection commands.
+`cdeck.py` contains the generic builder, inspector, verifier, and canonical writer.
 
-`cdeck.js` contains the browser reader, HTTP byte source, and lazy image loader.
+`cdeck.js` contains the browser parser, HTTP byte source, and deck payload-read API.
 
-`SPEC.md` is the actual file-format specification.
+`tools/cdeck001_to_002.py` is the standalone legacy migrator.
 
-`tests/` contains the Python and JavaScript test suites along with valid and intentionally broken CDECK fixtures.
+`SPEC.md` is the normative CDECK002 wire-format specification.
 
-The shared `tests/fixtures/vectors.json` manifest gives both runtimes the same expected fixture results.
-
-The GitHub Actions workflow runs both test suites, checks diff integrity, and enforces the 1,000-line production-code ceiling.
+Production code is kept under a hard 1,000-line ceiling across `cdeck.py` and `cdeck.js`.
 
 ## Requirements
 
-The Python side uses the standard library only.
+The Python implementation uses only the standard library.
 
-No third-party Python packages are required.
+The JavaScript implementation uses standard modern web and JavaScript APIs.
 
-For browser use, CDECK relies on normal modern web APIs including:
-
-```text
-fetch
-TextDecoder
-TextEncoder
-Blob
-URL.createObjectURL
-IntersectionObserver
-```
+No database or server-side runtime is required to read a hosted CDECK archive.
 
 ## Versioning
 
-I'm using simple whole-number software releases:
+Software releases use whole numbers:
 
 ```text
 v1
@@ -383,15 +386,13 @@ v3
 ...
 ```
 
-The file format has its own generation number:
+The wire format has its own generation identifier.
 
-```text
-CDECK001
-```
+`v1` and `v2` used CDECK001.
 
-If the software improves without changing the format, the format stays `CDECK001`.
+`v3` uses CDECK002.
 
-If the wire format ever genuinely needs to change, I'd rather introduce a new generation cleanly than slowly mutate the meaning of the old one.
+A future software release does not require a new wire generation unless the actual format contract changes.
 
 ## License
 

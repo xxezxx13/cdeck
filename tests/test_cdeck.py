@@ -1,5 +1,4 @@
 import contextlib
-import csv
 import io
 import json
 import struct
@@ -13,37 +12,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CDeckVerifierTests(unittest.TestCase):
-    def make_source(self, rows, files=None, fields=None):
+    def make_manifest(self, manifest, files=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-
         root = Path(temporary.name)
-
         for relative, data in (files or {}).items():
             path = root / relative
-            path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-
-        csv_path = root / "decks.csv"
-
-        with csv_path.open(
-            "w",
+        manifest_path = root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
-            newline="",
-        ) as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=fields or list(
-                    cdeck.SOURCE_FIELDS
-                ),
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-
-        return root, csv_path
+        )
+        return root, manifest_path
 
     def run_cli(self, *args):
         stdout = io.StringIO()
@@ -68,12 +50,9 @@ class CDeckVerifierTests(unittest.TestCase):
 
     def make_record(self, **updates):
         record = {
-            "id": "deck_test",
-            "name": "Test Deck",
-            "quantity": 1,
-            "brand": "",
-            "printer": "",
-            "jpegLength": 1,
+            "id": "asset_test",
+            "length": 1,
+            "meta": {"name": "Test"},
         }
         record.update(updates)
         return record
@@ -103,7 +82,7 @@ class CDeckVerifierTests(unittest.TestCase):
         ).encode("utf-8")
 
         data = (
-            b"CDECK001"
+            b"CDECK002"
             + struct.pack("<I", len(raw))
             + raw
             + payload
@@ -112,25 +91,25 @@ class CDeckVerifierTests(unittest.TestCase):
         return self.write_bytes(data)
 
     def test_valid_fixture(self):
-        result = cdeck.verify_file(
-            FIXTURES / "valid-one-record.cdeck"
+        path = self.write_archive(
+            [self.make_record()],
+            payload=b"x",
         )
+
+        result = cdeck.verify_file(path)
 
         self.assertEqual(
             result["format"],
-            "CDECK001",
+            "CDECK002",
         )
-
         self.assertEqual(
             result["recordCount"],
             1,
         )
-
         self.assertEqual(
-            result["expectedFileLength"],
-            11720,
+            result["payloadBytes"],
+            1,
         )
-
         self.assertEqual(
             result["warnings"],
             [],
@@ -167,32 +146,67 @@ class CDeckVerifierTests(unittest.TestCase):
         )
 
     def test_missing_required_member(self):
-        self.assert_invalid(
-            "missing-required-member.cdeck",
-            "missing required member",
+        record = self.make_record()
+        del record["length"]
+
+        path = self.write_archive(
+            [record],
+            payload=b"",
+        )
+
+        self.assert_invalid_path(
+            path,
+            "missing required member: length",
         )
 
     def test_duplicate_id(self):
-        self.assert_invalid(
-            "duplicate-id.cdeck",
+        path = self.write_archive(
+            [
+                self.make_record(id="same"),
+                self.make_record(id="same"),
+            ],
+            payload=b"xx",
+        )
+
+        self.assert_invalid_path(
+            path,
             "duplicate id",
         )
 
-    def test_invalid_quantity(self):
-        self.assert_invalid(
-            "invalid-quantity.cdeck",
-            "quantity out of range",
+    def test_invalid_length(self):
+        path = self.write_archive(
+            [self.make_record(length=-1)],
+            payload=b"",
         )
 
-    def test_invalid_jpeg_length(self):
-        self.assert_invalid(
-            "invalid-jpeg-length.cdeck",
-            "jpegLength out of range",
+        self.assert_invalid_path(
+            path,
+            "length out of range",
+        )
+
+    def test_unsafe_length_rejected(self):
+        path = self.write_archive(
+            [
+                self.make_record(
+                    length=cdeck.MAX_SAFE_INTEGER + 1
+                )
+            ],
+            payload=b"",
+        )
+
+        self.assert_invalid_path(
+            path,
+            "length out of range",
         )
 
     def test_truncated_payload(self):
-        self.assert_invalid(
-            "truncated-payload.cdeck",
+        path = self.write_archive(
+            [self.make_record(length=2)],
+            payload=b"x",
+        )
+
+        self.assert_invalid_path(
+            path,
             "file length mismatch",
         )
 
@@ -204,25 +218,19 @@ class CDeckVerifierTests(unittest.TestCase):
 
     def test_boolean_is_not_integer(self):
         path = self.write_archive(
-            {
-                "decks": [
-                    self.make_record(quantity=True)
-                ]
-            }
+            [self.make_record(length=True)],
+            payload=b"",
         )
 
         self.assert_invalid_path(
             path,
-            "quantity must be an integer",
+            "length must be an integer",
         )
 
     def test_empty_id_rejected(self):
         path = self.write_archive(
-            {
-                "decks": [
-                    self.make_record(id="")
-                ]
-            }
+            [self.make_record(id="")],
+            payload=b"x",
         )
 
         self.assert_invalid_path(
@@ -230,49 +238,37 @@ class CDeckVerifierTests(unittest.TestCase):
             "id must not be empty",
         )
 
-    def test_string_byte_limit_uses_utf8_bytes(self):
+    def test_meta_must_be_object(self):
         path = self.write_archive(
-            {
-                "decks": [
-                    self.make_record(
-                        id="é" * 251
-                    )
-                ]
-            }
+            [self.make_record(meta=[])],
+            payload=b"x",
         )
 
         self.assert_invalid_path(
             path,
-            "id exceeds UTF-8 byte limit",
+            "meta must be an object",
         )
 
-    def test_unknown_members_are_warnings(self):
+    def test_extra_core_member_rejected(self):
         path = self.write_archive(
-            {
-                "decks": [
-                    self.make_record(
-                        extra="value"
-                    )
-                ],
-                "future": True,
-            }
+            [
+                self.make_record(
+                    extra="value"
+                )
+            ],
+            payload=b"x",
         )
 
-        result = cdeck.verify_file(path)
-
-        self.assertEqual(
-            result["warnings"],
-            [
-                "unknown top-level member: future",
-                "record 1: unknown member: extra",
-            ],
+        self.assert_invalid_path(
+            path,
+            "unexpected member: extra",
         )
 
     def test_nonstandard_json_constant_rejected(self):
         raw = b"{\"decks\":[],\"future\":NaN}"
 
         data = (
-            b"CDECK001"
+            b"CDECK002"
             + struct.pack("<I", len(raw))
             + raw
         )
@@ -292,7 +288,7 @@ class CDeckVerifierTests(unittest.TestCase):
         raw = b"\xef\xbb\xbf" + index
 
         data = (
-            b"CDECK001"
+            b"CDECK002"
             + struct.pack("<I", len(raw))
             + raw
         )
@@ -308,20 +304,20 @@ class CDeckVerifierTests(unittest.TestCase):
         records = [
             self.make_record(
                 id="a",
-                jpegLength=2,
+                length=2,
             ),
             self.make_record(
                 id="b",
-                jpegLength=3,
+                length=3,
             ),
             self.make_record(
                 id="c",
-                jpegLength=1,
+                length=1,
             ),
         ]
 
         path = self.write_archive(
-            {"decks": records},
+            records,
             payload=b"abcdef",
         )
 
@@ -331,7 +327,6 @@ class CDeckVerifierTests(unittest.TestCase):
             result["offsets"],
             [0, 2, 5],
         )
-
         self.assertEqual(
             result["payloadBytes"],
             6,
@@ -339,10 +334,10 @@ class CDeckVerifierTests(unittest.TestCase):
 
     def test_index_length_limit(self):
         data = (
-            b"CDECK001"
+            b"CDECK002"
             + struct.pack(
                 "<I",
-                2_000_001,
+                cdeck.MAX_INDEX_BYTES + 1,
             )
         )
 
@@ -350,20 +345,23 @@ class CDeckVerifierTests(unittest.TestCase):
 
         self.assert_invalid_path(
             path,
-            "indexLength exceeds 2,000,000 bytes",
+            "indexLength exceeds 16 MiB runtime limit",
         )
 
     def test_record_count_limit(self):
         records = [
             self.make_record(
-                id=f"deck_{number}"
+                id=f"asset_{number}",
+                length=0,
             )
-            for number in range(4001)
+            for number in range(
+                cdeck.MAX_RECORDS + 1
+            )
         ]
 
         path = self.write_archive(
-            {"decks": records},
-            payload=b"x" * 4001,
+            records,
+            payload=b"",
         )
 
         self.assert_invalid_path(
@@ -371,453 +369,165 @@ class CDeckVerifierTests(unittest.TestCase):
             "record count exceeds limit",
         )
 
-    def test_missing_decks_member(self):
+    def test_index_must_be_array(self):
         path = self.write_archive(
-            {"future": []},
+            {"records": []},
             payload=b"",
         )
 
         self.assert_invalid_path(
             path,
-            "missing required top-level member: decks",
+            "index must be an array",
         )
 
-
-    def test_build_is_deterministic_and_preserves_order(self):
-        rows = [
-            {
-                "src": "images/deck_002_Beta.jpg",
-                "name": "Beta",
-                "quantity": "2",
-                "brand": "",
-                "printer": "",
-            },
-            {
-                "src": "images/deck_001_Alpha.jpg",
-                "name": "Alpha",
-                "quantity": "1",
-                "brand": "Brand",
-                "printer": "Printer",
-            },
+    def test_build_is_deterministic_and_preserves_manifest_order(self):
+        manifest = [
+            {"id": "beta", "path": "payloads/beta.bin", "meta": {"name": "Beta"}},
+            {"id": "alpha", "path": "payloads/alpha.bin", "meta": {"name": "Alpha"}},
+            {"id": "empty", "path": "payloads/empty.bin", "meta": {}},
         ]
-
-        root, csv_path = self.make_source(
-            rows,
+        root, manifest_path = self.make_manifest(
+            manifest,
             files={
-                "images/deck_001_Alpha.jpg": b"\xff\xd8",
-                "images/deck_002_Beta.jpg": b"\xff\xd8B",
+                "payloads/beta.bin": b"\x00\xffBINARY",
+                "payloads/alpha.bin": b"ALPHA",
+                "payloads/empty.bin": b"",
             },
         )
-
         first = root / "first.cdeck"
         second = root / "second.cdeck"
+        first_result = cdeck.build_collection(manifest_path, first)
+        second_result = cdeck.build_collection(manifest_path, second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(first_result, second_result)
+        inspected = cdeck.inspect_file(first)
+        self.assertEqual([record["id"] for record in inspected["records"]], ["beta", "alpha", "empty"])
+        self.assertEqual([record["length"] for record in inspected["records"]], [8, 5, 0])
+        self.assertTrue(all("path" not in record for record in inspected["records"]))
+        self.assertEqual(first.read_bytes()[inspected["payloadStart"]:], b"\x00\xffBINARYALPHA")
+        cdeck.verify_canonical(first)
 
-        first_result = cdeck.build_collection(
-            csv_path,
-            first,
-        )
+    def test_manifest_must_be_array(self):
+        root, manifest_path = self.make_manifest({"id": "bad"})
+        with self.assertRaisesRegex(cdeck.CDeckError, "manifest must be an array"):
+            cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        second_result = cdeck.build_collection(
-            csv_path,
-            second,
-        )
-
-        self.assertEqual(
-            first.read_bytes(),
-            second.read_bytes(),
-        )
-
-        self.assertEqual(
-            first_result["recordCount"],
-            2,
-        )
-
-        self.assertEqual(
-            first_result,
-            second_result,
-        )
-
-        data = first.read_bytes()
-        index_length = struct.unpack(
-            "<I",
-            data[8:12],
-        )[0]
-
-        payload_start = 12 + index_length
-
-        index = json.loads(
-            data[12:payload_start].decode("utf-8")
-        )
-
-        self.assertEqual(
-            [
-                record["id"]
-                for record in index["decks"]
-            ],
-            [
-                "deck_002_Beta",
-                "deck_001_Alpha",
-            ],
-        )
-
-        self.assertEqual(
-            data[payload_start:],
-            b"\xff\xd8B\xff\xd8",
-        )
-
-    def test_build_rejects_unexpected_source_field(self):
-        rows = [
-            {
-                "src": "images/deck_001_A.jpg",
-                "name": "A",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-                "extra": "bad",
-            }
+    def test_manifest_entry_shape_is_exact(self):
+        cases = [
+            ([{"id": "x", "meta": {}}], "missing manifest member: path"),
+            ([{"id": "x", "path": "payload.bin", "meta": {}, "extra": 1}], "unexpected manifest member: extra"),
         ]
+        for manifest, message in cases:
+            with self.subTest(message=message):
+                root, manifest_path = self.make_manifest(manifest)
+                with self.assertRaisesRegex(cdeck.CDeckError, message):
+                    cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/deck_001_A.jpg": b"A",
-            },
-            fields=[
-                *cdeck.SOURCE_FIELDS,
-                "extra",
-            ],
-        )
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "unexpected source field: extra",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-    def test_build_rejects_missing_jpeg(self):
-        rows = [
-            {
-                "src": "images/deck_001_Missing.jpg",
-                "name": "Missing",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
+    def test_manifest_rejects_duplicate_ids(self):
+        manifest = [
+            {"id": "same", "path": "a.bin", "meta": {}},
+            {"id": "same", "path": "b.bin", "meta": {}},
         ]
+        root, manifest_path = self.make_manifest(manifest, {"a.bin": b"A", "b.bin": b"B"})
+        with self.assertRaisesRegex(cdeck.CDeckError, "duplicate id"):
+            cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        root, csv_path = self.make_source(rows)
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "missing JPEG",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-    def test_build_rejects_duplicate_derived_id(self):
-        rows = [
-            {
-                "src": "images/deck_same.jpg",
-                "name": "One",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            },
-            {
-                "src": "other/deck_same.jpg",
-                "name": "Two",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            },
+    def test_manifest_validates_metadata_profile(self):
+        cases = [
+            ({"value": 1.5}, "JSON floats are not allowed"),
+            ({"value": cdeck.MAX_SAFE_INTEGER + 1}, "JSON integer exceeds safe integer limit"),
         ]
+        for meta, message in cases:
+            with self.subTest(message=message):
+                manifest = [{"id": "x", "path": "payload.bin", "meta": meta}]
+                root, manifest_path = self.make_manifest(manifest, {"payload.bin": b""})
+                with self.assertRaisesRegex(cdeck.CDeckError, message):
+                    cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/deck_same.jpg": b"\xff\xd8",
-                "other/deck_same.jpg": b"\xff\xd8",
-            },
-        )
+    def test_build_rejects_missing_payload(self):
+        manifest = [{"id": "missing", "path": "missing.bin", "meta": {}}]
+        root, manifest_path = self.make_manifest(manifest)
+        with self.assertRaisesRegex(cdeck.CDeckError, "missing payload"):
+            cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "duplicate id",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-    def test_build_rejects_unsafe_source_path(self):
-        rows = [
-            {
-                "src": "../outside.jpg",
-                "name": "Outside",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-
-        root, csv_path = self.make_source(rows)
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "unsafe src path",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-
+    def test_build_rejects_unsafe_payload_paths(self):
+        root, manifest_path = self.make_manifest([], {"payload.bin": b"X"})
+        values = ["../outside.bin", str((root / "payload.bin").resolve())]
+        for value in values:
+            with self.subTest(path=value):
+                manifest = [{"id": "x", "path": value, "meta": {}}]
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(cdeck.CDeckError, "unsafe payload path"):
+                    cdeck.build_collection(manifest_path, root / "output.cdeck")
 
     def test_build_rejects_symlink_escape(self):
-        rows = [
-            {
-                "src": "images/escape.jpg",
-                "name": "Escape",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-        root, csv_path = self.make_source(rows)
-        outside = self.write_bytes(b"\xff\xd8X")
-        link = root / "images" / "escape.jpg"
-        link.parent.mkdir(parents=True, exist_ok=True)
-        link.symlink_to(outside)
+        outside = self.write_bytes(b"OUTSIDE")
+        manifest = [{"id": "escape", "path": "escape.bin", "meta": {}}]
+        root, manifest_path = self.make_manifest(manifest)
+        (root / "escape.bin").symlink_to(outside)
+        with self.assertRaisesRegex(cdeck.CDeckError, "unsafe payload path"):
+            cdeck.build_collection(manifest_path, root / "output.cdeck")
 
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "unsafe src path",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-    def test_build_allows_internal_symlink_and_preserves_bytes(self):
-        payload = b"\xff\xd8JPEG-BYTES"
-        rows = [
-            {
-                "src": "images/link.jpg",
-                "name": "Internal",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/real.jpg": payload,
-            },
-        )
-        (root / "images" / "link.jpg").symlink_to("real.jpg")
+    def test_build_allows_internal_symlink_and_arbitrary_binary(self):
+        payload = b"\x00OPAQUE-BINARY\xff\x01"
+        manifest = [{"id": "binary", "path": "link.bin", "meta": {"kind": "opaque"}}]
+        root, manifest_path = self.make_manifest(manifest, {"real.bin": payload})
+        (root / "link.bin").symlink_to("real.bin")
         archive = root / "output.cdeck"
+        result = cdeck.build_collection(manifest_path, archive)
+        self.assertEqual(archive.read_bytes()[result["payloadStart"]:], payload)
 
-        result = cdeck.build_collection(
-            csv_path,
-            archive,
-        )
+    def test_build_rejects_overwriting_manifest_or_payload(self):
+        manifest = [{"id": "x", "path": "payload.bin", "meta": {}}]
+        root, manifest_path = self.make_manifest(manifest, {"payload.bin": b"X"})
+        with self.assertRaisesRegex(cdeck.CDeckError, "output path must not replace manifest"):
+            cdeck.build_collection(manifest_path, manifest_path)
+        with self.assertRaisesRegex(cdeck.CDeckError, "output path must not replace source payload"):
+            cdeck.build_collection(manifest_path, root / "payload.bin")
 
-        self.assertEqual(
-            archive.read_bytes()[result["payloadStart"]:],
-            payload,
-        )
-
-    def test_build_rejects_non_jpeg_soi(self):
-        rows = [
-            {
-                "src": "images/not-jpeg.jpg",
-                "name": "Not JPEG",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/not-jpeg.jpg": b"NO",
-            },
-        )
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "JPEG must start with FF D8",
-        ):
-            cdeck.build_collection(
-                csv_path,
-                root / "output.cdeck",
-            )
-
-    def test_source_equivalence_passes(self):
-        rows = [
-            {
-                "src": "images/deck_001_A.jpg",
-                "name": "Alpha",
-                "quantity": "2",
-                "brand": "Brand",
-                "printer": "Printer",
-            },
-            {
-                "src": "images/deck_002_B.jpg",
-                "name": "Beta",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            },
-        ]
-
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/deck_001_A.jpg": b"\xff\xd8A",
-                "images/deck_002_B.jpg": b"\xff\xd8BB",
-            },
-        )
-
+    def test_source_equivalence_passes_and_detects_payload_change(self):
+        manifest = [{"id": "x", "path": "payload.bin", "meta": {"name": "Original"}}]
+        root, manifest_path = self.make_manifest(manifest, {"payload.bin": b"ABC"})
         archive = root / "collection.cdeck"
-
-        cdeck.build_collection(
-            csv_path,
-            archive,
-        )
-
-        result = cdeck.verify_source(
-            archive,
-            csv_path,
-        )
-
-        self.assertEqual(
-            result["sourceVerified"],
-            2,
-        )
-
-    def test_source_equivalence_detects_image_change(self):
-        rows = [
-            {
-                "src": "images/deck_001_A.jpg",
-                "name": "Alpha",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/deck_001_A.jpg": b"\xff\xd8A",
-            },
-        )
-
-        archive = root / "collection.cdeck"
-
-        cdeck.build_collection(
-            csv_path,
-            archive,
-        )
-
-        image = root / "images/deck_001_A.jpg"
-        image.write_bytes(b"\xff\xd8B")
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "JPEG SHA-256 mismatch",
-        ):
-            cdeck.verify_source(
-                archive,
-                csv_path,
-            )
+        cdeck.build_collection(manifest_path, archive)
+        result = cdeck.verify_source(archive, manifest_path)
+        self.assertEqual(result["sourceVerified"], 1)
+        (root / "payload.bin").write_bytes(b"ABD")
+        with self.assertRaisesRegex(cdeck.CDeckError, "payload SHA-256 mismatch"):
+            cdeck.verify_source(archive, manifest_path)
 
     def test_source_equivalence_detects_metadata_change(self):
-        rows = [
-            {
-                "src": "images/deck_001_A.jpg",
-                "name": "Alpha",
-                "quantity": "1",
-                "brand": "",
-                "printer": "",
-            }
-        ]
-
-        root, csv_path = self.make_source(
-            rows,
-            files={
-                "images/deck_001_A.jpg": b"\xff\xd8A",
-            },
-        )
-
+        manifest = [{"id": "x", "path": "payload.bin", "meta": {"name": "Original"}}]
+        root, manifest_path = self.make_manifest(manifest, {"payload.bin": b"ABC"})
         archive = root / "collection.cdeck"
-
-        cdeck.build_collection(
-            csv_path,
-            archive,
-        )
-
-        rows[0]["name"] = "Omega"
-
-        with csv_path.open(
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=list(
-                    cdeck.SOURCE_FIELDS
-                ),
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-
-        with self.assertRaisesRegex(
-            cdeck.CDeckError,
-            "metadata mismatch: name",
-        ):
-            cdeck.verify_source(
-                archive,
-                csv_path,
-            )
-
-
+        cdeck.build_collection(manifest_path, archive)
+        manifest[0]["meta"]["name"] = "Changed"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(cdeck.CDeckError, "metadata mismatch"):
+            cdeck.verify_source(archive, manifest_path)
 
     def test_inspect_derives_absolute_offsets(self):
         records = [
             self.make_record(
                 id="a",
-                jpegLength=2,
+                length=2,
             ),
             self.make_record(
                 id="b",
-                jpegLength=3,
+                length=3,
             ),
         ]
 
         path = self.write_archive(
-            {"decks": records},
+            records,
             payload=b"abcde",
         )
 
         result = cdeck.inspect_file(path)
 
         self.assertEqual(
-            result["recordCount"],
-            2,
-        )
-
-        self.assertEqual(
             [
-                record["jpegOffset"]
+                record["offset"]
                 for record in result["records"]
             ],
             [
@@ -828,18 +538,22 @@ class CDeckVerifierTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                record["jpegLength"]
+                record["length"]
                 for record in result["records"]
             ],
             [2, 3],
         )
 
     def test_inspect_does_not_add_offset_to_wire_record(self):
-        path = FIXTURES / "valid-one-record.cdeck"
+        path = self.write_archive(
+            [self.make_record()],
+            payload=b"x",
+        )
+
         result = cdeck.inspect_file(path)
 
         self.assertIn(
-            "jpegOffset",
+            "offset",
             result["records"][0],
         )
 
@@ -856,15 +570,81 @@ class CDeckVerifierTests(unittest.TestCase):
         )
 
         self.assertNotIn(
-            "jpegOffset",
-            index["decks"][0],
+            "offset",
+            index[0],
         )
 
+    def test_v3_rejects_cdeck001_generation(self):
+        raw = b"[]"
+        path = self.write_bytes(
+            b"CDECK001" + struct.pack("<I", len(raw)) + raw
+        )
+        with self.assertRaisesRegex(
+            cdeck.CDeckError,
+            "unsupported CDECK generation",
+        ):
+            cdeck.verify_file(path)
 
-    def test_v2_verify_canonical_accepts_writer_encoding(self):
-        path = self.write_archive(
-            {"decks": [self.make_record()]},
-            payload=b"x",
+    def test_v3_metadata_profile_values(self):
+        valid = self.make_record(
+            length=0,
+            meta={
+                "array": [None, True, False, -cdeck.MAX_SAFE_INTEGER, cdeck.MAX_SAFE_INTEGER],
+                "text": "é😀",
+            },
+        )
+        records, offsets, total = cdeck._validate_index([valid])
+        self.assertEqual(offsets, [0])
+        self.assertEqual(total, 0)
+        self.assertEqual(records[0]["meta"]["text"], "é😀")
+        cases = [
+            ({"value": 1.5}, "JSON floats are not allowed"),
+            ({"value": cdeck.MAX_SAFE_INTEGER + 1}, "JSON integer exceeds safe integer limit"),
+            ({"value": "\ud800"}, "JSON string contains lone surrogate"),
+            ({1: "bad"}, "JSON object key must be a string"),
+        ]
+        for meta, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(cdeck.CDeckError, message):
+                    cdeck._validate_index([self.make_record(length=0, meta=meta)])
+
+    def test_v3_canonical_encoder_profile(self):
+        raw = cdeck._encode_canonical_index([
+            self.make_record(
+                id="x",
+                length=0,
+                meta={
+                    "z": "é😀",
+                    "a": "\b\t\n\f\r\x00\x1f",
+                    "nest": {"😀": 2, "β": 1, "a": 0},
+                },
+            )
+        ])
+        expected = (
+            '[{"id":"x","length":0,"meta":'
+            '{"a":"\\b\\t\\n\\f\\r\\u0000\\u001f",'
+            '"nest":{"a":0,"β":1,"😀":2},"z":"é😀"}}]'
+        ).encode("utf-8")
+        self.assertEqual(raw, expected)
+
+    def test_v3_canonical_rejects_equivalent_noncanonical_forms(self):
+        raws = [
+            b'[{"id":"x","length":0,"meta":{"b":1,"a":2}}]',
+            b'[{"id":"\\u0078","length":0,"meta":{}}]',
+        ]
+        for raw in raws:
+            with self.subTest(raw=raw):
+                path = self.write_bytes(
+                    b"CDECK002" + struct.pack("<I", len(raw)) + raw
+                )
+                self.assertEqual(cdeck.verify_file(path)["recordCount"], 1)
+                with self.assertRaisesRegex(cdeck.CDeckError, "index is not canonical"):
+                    cdeck.verify_canonical(path)
+
+    def test_v3_verify_canonical_accepts_writer_encoding(self):
+        raw = cdeck._encode_canonical_index([self.make_record()])
+        path = self.write_bytes(
+            b"CDECK002" + struct.pack("<I", len(raw)) + raw + b"x"
         )
 
         status, stdout, stderr = self.run_cli(
@@ -874,25 +654,32 @@ class CDeckVerifierTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 0)
-        self.assertIn("format: CDECK001", stdout)
+        self.assertIn(
+            "format: CDECK002",
+            stdout,
+        )
         self.assertEqual(stderr, "")
 
-    def test_v2_verify_canonical_rejects_structurally_valid_noncanonical_index(self):
-        index = {"decks": [self.make_record()]}
+    def test_v3_verify_canonical_rejects_noncanonical_index(self):
+        index = [self.make_record()]
+
         raw = json.dumps(
             index,
             ensure_ascii=False,
             indent=2,
         ).encode("utf-8")
+
         path = self.write_bytes(
-            b"CDECK001"
+            b"CDECK002"
             + struct.pack("<I", len(raw))
             + raw
             + b"x"
         )
 
         self.assertEqual(
-            cdeck.verify_file(path)["recordCount"],
+            cdeck.verify_file(path)[
+                "recordCount"
+            ],
             1,
         )
 
@@ -904,30 +691,47 @@ class CDeckVerifierTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertEqual(stdout, "")
-        self.assertIn("index is not canonical", stderr)
+        self.assertIn(
+            "index is not canonical",
+            stderr,
+        )
 
-    def test_v2_inspect_json_emits_json_only(self):
+    def test_v3_inspect_json_emits_json_only(self):
+        path = self.write_archive(
+            [self.make_record()],
+            payload=b"x",
+        )
+
         status, stdout, stderr = self.run_cli(
             "inspect",
-            str(FIXTURES / "valid-one-record.cdeck"),
+            str(path),
             "--json",
         )
 
         self.assertEqual(status, 0)
+
         result = json.loads(stdout)
-        self.assertEqual(result["format"], "CDECK001")
-        self.assertEqual(result["recordCount"], 1)
-        self.assertEqual(len(result["records"]), 1)
+
+        self.assertEqual(
+            result["recordCount"],
+            1,
+        )
+        self.assertEqual(
+            len(result["records"]),
+            1,
+        )
         self.assertEqual(stderr, "")
 
-    def test_v2_inspect_id_filters_exact_record(self):
+    def test_v3_inspect_id_filters_exact_record(self):
         path = self.write_archive(
-            {
-                "decks": [
-                    self.make_record(id="alpha"),
-                    self.make_record(id="beta"),
-                ]
-            },
+            [
+                self.make_record(
+                    id="alpha"
+                ),
+                self.make_record(
+                    id="beta"
+                ),
+            ],
             payload=b"xx",
         )
 
@@ -939,13 +743,23 @@ class CDeckVerifierTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 0)
-        self.assertIn("id='beta'", stdout)
-        self.assertNotIn("id='alpha'", stdout)
+        self.assertIn(
+            "id=" + repr("beta"),
+            stdout,
+        )
+        self.assertNotIn(
+            "id=" + repr("alpha"),
+            stdout,
+        )
         self.assertEqual(stderr, "")
 
-    def test_v2_inspect_id_rejects_unknown_record(self):
+    def test_v3_inspect_id_rejects_unknown_record(self):
         path = self.write_archive(
-            {"decks": [self.make_record(id="alpha")]},
+            [
+                self.make_record(
+                    id="alpha"
+                )
+            ],
             payload=b"x",
         )
 
@@ -958,12 +772,20 @@ class CDeckVerifierTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertEqual(stdout, "")
-        self.assertIn("record id not found: missing", stderr)
+        self.assertIn(
+            "record id not found: missing",
+            stderr,
+        )
 
-    def test_v2_verify_quiet_has_no_success_output(self):
+    def test_v3_verify_quiet_has_no_success_output(self):
+        path = self.write_archive(
+            [self.make_record()],
+            payload=b"x",
+        )
+
         status, stdout, stderr = self.run_cli(
             "verify",
-            str(FIXTURES / "valid-one-record.cdeck"),
+            str(path),
             "--quiet",
         )
 
@@ -971,34 +793,74 @@ class CDeckVerifierTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "")
 
-    def test_v2_shared_fixture_vectors(self):
-        vectors = json.loads(
-            (FIXTURES / "vectors.json").read_text(
-                encoding="utf-8"
-            )
+    def test_v3_numeric_model_boundaries(self):
+        values = [
+            (2 ** 32) - 1,
+            2 ** 32,
+            (2 ** 32) + 1,
+            8 * (2 ** 30),
+            cdeck.MAX_SAFE_INTEGER,
+        ]
+
+        for value in values:
+            with self.subTest(value=value):
+                records, offsets, total = (
+                    cdeck._validate_index([
+                        self.make_record(
+                            length=value
+                        )
+                    ])
+                )
+
+                self.assertEqual(
+                    offsets,
+                    [0],
+                )
+                self.assertEqual(
+                    total,
+                    value,
+                )
+                self.assertEqual(
+                    records[0]["length"],
+                    value,
+                )
+
+        records, offsets, total = (
+            cdeck._validate_index([
+                self.make_record(
+                    length=0
+                )
+            ])
         )
-        for vector in vectors:
-            path = FIXTURES / vector["file"]
-            with self.subTest(file=vector["file"]):
-                if vector["valid"]:
-                    result = cdeck.verify_file(path)
-                    self.assertEqual(
-                        result["recordCount"],
-                        vector["recordCount"],
-                    )
-                    self.assertEqual(
-                        result["expectedFileLength"],
-                        vector["expectedFileLength"],
-                    )
-                else:
-                    with self.assertRaises(
-                        cdeck.CDeckError
-                    ) as raised:
-                        cdeck.verify_file(path)
-                    self.assertIn(
-                        vector["error"],
-                        str(raised.exception),
-                    )
+
+        self.assertEqual(offsets, [0])
+        self.assertEqual(total, 0)
+
+        with self.assertRaisesRegex(
+            cdeck.CDeckError,
+            "length out of range",
+        ):
+            cdeck._validate_index([
+                self.make_record(
+                    length=2 ** 53
+                )
+            ])
+
+        with self.assertRaisesRegex(
+            cdeck.CDeckError,
+            "cumulative payload length exceeds safe integer limit",
+        ):
+            cdeck._validate_index([
+                self.make_record(
+                    id="first",
+                    length=cdeck.MAX_SAFE_INTEGER,
+                ),
+                self.make_record(
+                    id="second",
+                    length=1,
+                ),
+            ])
+
 
 if __name__ == "__main__":
     unittest.main()

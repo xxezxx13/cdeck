@@ -1,265 +1,335 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
   CDeckError,
   createHttpSource,
-  createLazyImageLoader,
   openCdeck,
   parseCdeckBuffer,
 } from "../cdeck.js";
 
-const fixture = (name) => (
-  fs.readFileSync(
-    new URL(`fixtures/${name}`, import.meta.url),
-  )
+const encoder = new TextEncoder();
+const httpSource = (url, fetch, options = {}) => (
+  createHttpSource(url, { ...options, fetch })
 );
 
-const sharedVectors = JSON.parse(
-  fs.readFileSync(
-    new URL("fixtures/vectors.json", import.meta.url),
-    "utf8",
-  ),
-);
+const makeRecord = (updates = {}) => ({
+  id: "asset",
+  length: 1,
+  meta: { name: "Example" },
+  ...updates,
+});
 
-test(
-  "V2: Python and JavaScript share fixture vectors",
-  () => {
-    for (const vector of sharedVectors) {
-      if (vector.valid) {
-        const result = parseCdeckBuffer(
-          fixture(vector.file),
-        );
-        assert.equal(
-          result.recordCount,
-          vector.recordCount,
-        );
-        assert.equal(
-          result.expectedFileLength,
-          vector.expectedFileLength,
-        );
-      } else {
-        assert.throws(
-          () => parseCdeckBuffer(
-            fixture(vector.file),
-          ),
-          (error) => (
-            error instanceof CDeckError
-            && error.message.includes(vector.error)
-          ),
-          vector.file,
-        );
-      }
-    }
-  },
-);
-
-const invalid = [
-  ["wrong-magic.cdeck", /wrong magic/],
-  [
-    "unsupported-generation.cdeck",
-    /unsupported CDECK generation/,
-  ],
-  [
-    "zero-index.cdeck",
-    /indexLength must be greater than zero/,
-  ],
-  [
-    "malformed-utf8.cdeck",
-    /invalid UTF-8 index/,
-  ],
-  [
-    "invalid-json.cdeck",
-    /invalid JSON index/,
-  ],
-  [
-    "missing-required-member.cdeck",
-    /missing required member/,
-  ],
-  [
-    "duplicate-id.cdeck",
-    /duplicate id/,
-  ],
-  [
-    "invalid-quantity.cdeck",
-    /quantity out of range/,
-  ],
-  [
-    "invalid-jpeg-length.cdeck",
-    /jpegLength out of range/,
-  ],
-  [
-    "truncated-payload.cdeck",
-    /file length mismatch/,
-  ],
-];
-
-test(
-  "valid fixture parses with absolute JPEG offset",
-  () => {
-    const result = parseCdeckBuffer(
-      fixture("valid-one-record.cdeck"),
-    );
-
-    assert.equal(
-      result.format,
-      "CDECK001",
-    );
-
-    assert.equal(
-      result.indexLength,
-      205,
-    );
-
-    assert.equal(
-      result.payloadStart,
-      217,
-    );
-
-    assert.equal(
-      result.recordCount,
-      1,
-    );
-
-    assert.equal(
-      result.expectedFileLength,
-      11720,
-    );
-
-    assert.equal(
-      result.records[0].jpegOffset,
-      217,
-    );
-
-    assert.equal(
-      result.records[0].jpegLength,
-      11503,
-    );
-  },
-);
-
-for (const [name, pattern] of invalid) {
-  test(
-    `rejects ${name}`,
-    () => {
-      assert.throws(
-        () => parseCdeckBuffer(fixture(name)),
-        pattern,
-      );
-    },
-  );
+function makeArchive(index, payload = new Uint8Array()) {
+  const raw = encoder.encode(JSON.stringify(index));
+  const bytes = new Uint8Array(12 + raw.byteLength + payload.byteLength);
+  bytes.set(encoder.encode("CDECK002"), 0);
+  new DataView(bytes.buffer).setUint32(8, raw.byteLength, true);
+  bytes.set(raw, 12);
+  bytes.set(payload, 12 + raw.byteLength);
+  return bytes;
 }
 
-test(
-  "accepts ArrayBuffer input",
-  () => {
-    const buffer = fixture(
-      "valid-one-record.cdeck",
-    );
+function indexSource(records, size = null) {
+  const raw = encoder.encode(JSON.stringify(records));
+  const header = new Uint8Array(12);
+  header.set(encoder.encode("CDECK002"), 0);
+  new DataView(header.buffer).setUint32(8, raw.byteLength, true);
+  return {
+    size,
+    async read(start, length) {
+      if (start === 0) return header.slice(0, length);
+      if (start === 12) return raw.slice(0, length);
+      throw new Error(`unexpected read: ${start},${length}`);
+    },
+  };
+}
 
-    const arrayBuffer = buffer.buffer.slice(
-      buffer.byteOffset,
-      buffer.byteOffset + buffer.byteLength,
-    );
+test("V3: parses exact generic record shape", () => {
+  const result = parseCdeckBuffer(
+    makeArchive(
+      [
+        makeRecord({
+          length: 3,
+          meta: { nested: { value: 1 } },
+        }),
+      ],
+      Uint8Array.from([1, 2, 3]),
+    ),
+  );
+  assert.equal(result.format, "CDECK002");
+  assert.equal(result.recordCount, 1);
+  assert.equal(result.payloadBytes, 3);
+  assert.equal(result.records[0].length, 3);
+  assert.equal(result.records[0].meta.nested.value, 1);
+  assert.deepEqual(
+    Object.keys(result.records[0]).sort(),
+    ["id", "length", "meta"],
+  );
+  assert.equal(result.records[0].offset, undefined);
+  assert.equal(result.records[0].jpegOffset, undefined);
+});
 
-    assert.equal(
-      parseCdeckBuffer(arrayBuffer).recordCount,
-      1,
-    );
-  },
-);
+test("V3: index must be a top-level array", () => {
+  assert.throws(
+    () => parseCdeckBuffer(makeArchive({ records: [] })),
+    /index must be an array/,
+  );
+});
 
-test(
-  "respects typed-array byteOffset",
-  () => {
-    const source = fixture(
-      "valid-one-record.cdeck",
-    );
+test("V3: record shape is exact", () => {
+  const missing = makeRecord();
+  delete missing.length;
+  assert.throws(
+    () => parseCdeckBuffer(makeArchive([missing])),
+    /missing required member: length/,
+  );
+  assert.throws(
+    () => parseCdeckBuffer(makeArchive([makeRecord({ extra: true })])),
+    /unexpected member: extra/,
+  );
+});
 
-    const wrapped = new Uint8Array(
-      source.byteLength + 20,
-    );
+test("V3: IDs are non-empty and unique", () => {
+  assert.throws(
+    () => parseCdeckBuffer(makeArchive([makeRecord({ id: "" })])),
+    /id must not be empty/,
+  );
+  assert.throws(
+    () => parseCdeckBuffer(
+      makeArchive([
+        makeRecord({ id: "same" }),
+        makeRecord({ id: "same" }),
+      ]),
+    ),
+    /duplicate id/,
+  );
+});
 
-    wrapped.set(source, 10);
-
-    const view = wrapped.subarray(
-      10,
-      10 + source.byteLength,
-    );
-
-    assert.equal(
-      parseCdeckBuffer(view).recordCount,
-      1,
-    );
-  },
-);
-
-test(
-  "rejects UTF-8 BOM",
-  () => {
-    const index = new TextEncoder().encode(
-      "{\"decks\":[]}",
-    );
-
-    const bytes = new Uint8Array(
-      12 + 3 + index.byteLength,
-    );
-
-    bytes.set(
-      new TextEncoder().encode("CDECK001"),
-      0,
-    );
-
-    new DataView(bytes.buffer).setUint32(
-      8,
-      3 + index.byteLength,
-      true,
-    );
-
-    bytes.set(
-      [0xef, 0xbb, 0xbf],
-      12,
-    );
-
-    bytes.set(index, 15);
-
+test("V3: lengths use safe-integer rules", () => {
+  for (const [value, pattern] of [
+    [true, /length must be an integer/],
+    [-1, /length out of range/],
+    [2 ** 53, /length out of range/],
+  ]) {
     assert.throws(
-      () => parseCdeckBuffer(bytes),
-      /UTF-8 BOM/,
+      () => parseCdeckBuffer(makeArchive([makeRecord({ length: value })])),
+      pattern,
     );
-  },
-);
+  }
+});
 
-test(
-  "rejects invalid input object",
-  () => {
+test("V3: zero-length payload is valid", () => {
+  const result = parseCdeckBuffer(
+    makeArchive([makeRecord({ length: 0 })]),
+  );
+  assert.equal(result.payloadBytes, 0);
+  assert.equal(result.records[0].length, 0);
+});
+
+test("V3: meta must be an object", () => {
+  for (const meta of [null, [], "bad", 1]) {
     assert.throws(
-      () => parseCdeckBuffer({}),
-      CDeckError,
+      () => parseCdeckBuffer(makeArchive([makeRecord({ meta })])),
+      /meta must be an object/,
     );
-  },
-);
+  }
+});
 
-test(
-  "native JSON parsing does not detect duplicate keys",
-  () => {
-    const result = parseCdeckBuffer(
-      fixture("duplicate-json-member.cdeck"),
+test("V3: metadata profile accepts recursive safe values", () => {
+  const result = parseCdeckBuffer(
+    makeArchive([
+      makeRecord({
+        length: 0,
+        meta: {
+          array: [null, true, false, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+          text: "é😀",
+          nested: { "😀": 2, "β": 1, a: 0 },
+        },
+      }),
+    ]),
+  );
+  assert.equal(result.records[0].meta.text, "é😀");
+});
+
+test("V3: metadata profile rejects forbidden values", () => {
+  const cases = [
+    [{ value: 1.5 }, /JSON floats are not allowed/],
+    [{ value: Number.MAX_SAFE_INTEGER + 1 }, /JSON integer exceeds safe integer limit/],
+    [{ value: "\ud800" }, /JSON string contains lone surrogate/],
+    [{ "\ud800": "bad" }, /JSON string contains lone surrogate/],
+  ];
+  for (const [meta, pattern] of cases) {
+    assert.throws(
+      () => parseCdeckBuffer(
+        makeArchive([makeRecord({ length: 0, meta })]),
+      ),
+      pattern,
     );
+  }
+});
 
-    assert.equal(
-      result.records[0].id,
-      "duplicate",
-    );
-  },
-);
+test("V3: unknown metadata keys are preserved", () => {
+  const result = parseCdeckBuffer(
+    makeArchive([
+      makeRecord({
+        length: 0,
+        meta: { future: { nested: true } },
+      }),
+    ]),
+  );
+  assert.equal(result.records[0].meta.future.nested, true);
+});
 
+test("V3: ArrayBuffer and typed-array views are accepted", () => {
+  const archive = makeArchive(
+    [makeRecord()],
+    Uint8Array.from([1]),
+  );
+  const buffer = archive.buffer.slice(
+    archive.byteOffset,
+    archive.byteOffset + archive.byteLength,
+  );
+  assert.equal(parseCdeckBuffer(buffer).recordCount, 1);
+  const wrapped = new Uint8Array(archive.byteLength + 20);
+  wrapped.set(archive, 10);
+  assert.equal(
+    parseCdeckBuffer(
+      wrapped.subarray(10, 10 + archive.byteLength),
+    ).recordCount,
+    1,
+  );
+});
+
+test("V3: UTF-8 BOM is rejected", () => {
+  const raw = encoder.encode("[]");
+  const bytes = new Uint8Array(15 + raw.byteLength);
+  bytes.set(encoder.encode("CDECK002"), 0);
+  new DataView(bytes.buffer).setUint32(8, raw.byteLength + 3, true);
+  bytes.set([0xef, 0xbb, 0xbf], 12);
+  bytes.set(raw, 15);
+  assert.throws(() => parseCdeckBuffer(bytes), /UTF-8 BOM/);
+});
+
+test("V3: malformed JSON and UTF-8 are rejected", () => {
+  for (const [raw, pattern] of [
+    [Uint8Array.from([0x7b]), /invalid JSON index/],
+    [Uint8Array.from([0xff]), /invalid UTF-8 index/],
+  ]) {
+    const bytes = new Uint8Array(12 + raw.byteLength);
+    bytes.set(encoder.encode("CDECK002"), 0);
+    new DataView(bytes.buffer).setUint32(8, raw.byteLength, true);
+    bytes.set(raw, 12);
+    assert.throws(() => parseCdeckBuffer(bytes), pattern);
+  }
+});
+
+test("V3: CDECK001 is rejected as an unsupported generation", () => {
+  const bytes = new Uint8Array(12);
+  bytes.set(encoder.encode("CDECK001"), 0);
+  new DataView(bytes.buffer).setUint32(8, 1, true);
+  assert.throws(
+    () => parseCdeckBuffer(bytes),
+    /unsupported CDECK generation/,
+  );
+});
+
+test("V3: header validation remains strict", () => {
+  const wrong = new Uint8Array(12);
+  wrong.set(encoder.encode("BADDECK!"), 0);
+  new DataView(wrong.buffer).setUint32(8, 1, true);
+  assert.throws(() => parseCdeckBuffer(wrong), /wrong magic/);
+  const future = new Uint8Array(12);
+  future.set(encoder.encode("CDECK999"), 0);
+  new DataView(future.buffer).setUint32(8, 1, true);
+  assert.throws(
+    () => parseCdeckBuffer(future),
+    /unsupported CDECK generation/,
+  );
+  const zero = new Uint8Array(12);
+  zero.set(encoder.encode("CDECK002"), 0);
+  assert.throws(
+    () => parseCdeckBuffer(zero),
+    /indexLength must be greater than zero/,
+  );
+});
+
+test("V3: index runtime guard is 16 MiB", () => {
+  const bytes = new Uint8Array(12);
+  bytes.set(encoder.encode("CDECK002"), 0);
+  new DataView(bytes.buffer).setUint32(
+    8,
+    (16 * 1024 * 1024) + 1,
+    true,
+  );
+  assert.throws(
+    () => parseCdeckBuffer(bytes),
+    /16 MiB runtime limit/,
+  );
+});
+
+test("V3: HTTP 200 fallback rejects declared oversized body before buffering", async () => {
+  let bodyReads = 0;
+  const source = httpSource(
+    "test-source",
+    async () => ({
+      status: 200,
+      headers: new Headers({ "Content-Length": "3" }),
+      async arrayBuffer() {
+        bodyReads += 1;
+        return Uint8Array.from([1, 2, 3]).buffer;
+      },
+    }),
+    { maxFullBytes: 2 },
+  );
+  await assert.rejects(
+    source.read(0, 1),
+    /full response exceeds maxFullBytes/,
+  );
+  assert.equal(bodyReads, 0);
+});
+
+test("V3: HTTP 200 fallback checks actual buffered size", async () => {
+  let bodyReads = 0;
+  const source = httpSource(
+    "test-source",
+    async () => ({
+      status: 200,
+      headers: new Headers(),
+      async arrayBuffer() {
+        bodyReads += 1;
+        return Uint8Array.from([1, 2, 3]).buffer;
+      },
+    }),
+    { maxFullBytes: 2 },
+  );
+  await assert.rejects(
+    source.read(0, 1),
+    /full response exceeds maxFullBytes/,
+  );
+  assert.equal(bodyReads, 1);
+});
+
+test("V3: maxFullBytes option requires a non-negative safe integer", () => {
+  assert.throws(
+    () => createHttpSource("test-source", { maxFullBytes: -1 }),
+    /maxFullBytes must be a non-negative safe integer/,
+  );
+  assert.throws(
+    () => createHttpSource(
+      "test-source",
+      { maxFullBytes: Number.MAX_SAFE_INTEGER + 1 },
+    ),
+    /maxFullBytes must be a non-negative safe integer/,
+  );
+});
 
 test("HTTP source reads exact 206 range", async () => {
   const calls = [];
 
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async (url, options) => {
       calls.push({ url, options });
@@ -292,7 +362,7 @@ test("HTTP source reads exact 206 range", async () => {
 test("HTTP source caches 200 fallback", async () => {
   let calls = 0;
 
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => {
       calls += 1;
@@ -318,7 +388,7 @@ test("HTTP source caches 200 fallback", async () => {
 });
 
 test("HTTP source rejects short 206 body", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => new Response(
       Uint8Array.from([0, 1]),
@@ -338,7 +408,7 @@ test("HTTP source rejects short 206 body", async () => {
 });
 
 test("HTTP source validates Content-Range", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => new Response(
       Uint8Array.from([0, 1, 2]),
@@ -358,7 +428,7 @@ test("HTTP source validates Content-Range", async () => {
 });
 
 test("HTTP source permits hidden Content-Range", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => new Response(
       Uint8Array.from([7, 8]),
@@ -373,7 +443,7 @@ test("HTTP source permits hidden Content-Range", async () => {
 });
 
 test("HTTP source rejects unexpected status", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => new Response(
       null,
@@ -388,7 +458,7 @@ test("HTTP source rejects unexpected status", async () => {
 });
 
 test("HTTP source reports network failure", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => {
       throw new Error("offline");
@@ -401,32 +471,108 @@ test("HTTP source reports network failure", async () => {
   );
 });
 
-test("HTTP source rejects invalid bounds before fetch", async () => {
-  const source = createHttpSource(
+test("HTTP source rejects unsafe bounds before fetch", async () => {
+  let calls = 0;
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => {
+      calls += 1;
       throw new Error("fetch must not run");
     },
   );
 
   await assert.rejects(
     source.read(-1, 1),
-    /read start must be a non-negative integer/,
+    /read start must be a non-negative safe integer/,
   );
 
   await assert.rejects(
     source.read(0, 0),
-    /read length must be a positive integer/,
+    /read length must be a positive safe integer/,
   );
 
   await assert.rejects(
-    source.read(0xffffffff, 1),
-    /read range exceeds 32-bit file limit/,
+    source.read(Number.MAX_SAFE_INTEGER + 1, 1),
+    /read start must be a non-negative safe integer/,
+  );
+
+  await assert.rejects(
+    source.read(0, Number.MAX_SAFE_INTEGER + 1),
+    /read length must be a positive safe integer/,
+  );
+
+  await assert.rejects(
+    source.read(Number.MAX_SAFE_INTEGER, 1),
+    /read range exceeds safe integer limit/,
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("V3: HTTP source addresses ranges beyond 32-bit", async () => {
+  const starts = [
+    (2 ** 32) - 1,
+    2 ** 32,
+    (2 ** 32) + 1,
+    8 * (2 ** 30),
+    Number.MAX_SAFE_INTEGER - 1,
+  ];
+  const seen = [];
+
+  const source = httpSource(
+    "test-source",
+    async (url, options) => {
+      const range = options.headers.Range;
+      const start = starts[seen.length];
+
+      seen.push(range);
+
+      return new Response(
+        Uint8Array.from([seen.length]),
+        {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes ${start}-${start}/${Number.MAX_SAFE_INTEGER}`,
+          },
+        },
+      );
+    },
+  );
+
+  for (const start of starts) {
+    const bytes = await source.read(start, 1);
+    assert.equal(bytes.byteLength, 1);
+  }
+
+  assert.deepEqual(
+    seen,
+    starts.map((start) => `bytes=${start}-${start}`),
+  );
+  assert.equal(source.size, Number.MAX_SAFE_INTEGER);
+});
+
+test("V3: HTTP source rejects 2^53 Content-Range total", async () => {
+  const source = httpSource(
+    "test-source",
+    async () => new Response(
+      Uint8Array.from([1]),
+      {
+        status: 206,
+        headers: {
+          "Content-Range": "bytes 0-0/9007199254740992",
+        },
+      },
+    ),
+  );
+
+  await assert.rejects(
+    source.read(0, 1),
+    /invalid Content-Range total/,
   );
 });
 
 test("HTTP 200 fallback validates bounds", async () => {
-  const source = createHttpSource(
+  const source = httpSource(
     "https://example.test/collection.cdeck",
     async () => new Response(
       Uint8Array.from([0, 1]),
@@ -441,11 +587,11 @@ test("HTTP 200 fallback validates bounds", async () => {
 });
 
 
-test("V2: strong ETag locks HTTP source snapshot", async () => {
+test("V3: strong ETag locks HTTP source snapshot", async () => {
   let request = 0;
   let bodyReads = 0;
   const quote = String.fromCharCode(34);
-  const source = createHttpSource(
+  const source = httpSource(
     "test-source",
     async () => {
       request += 1;
@@ -473,10 +619,10 @@ test("V2: strong ETag locks HTTP source snapshot", async () => {
   assert.equal(bodyReads, 1);
 });
 
-test("V2: weak ETag does not lock HTTP source snapshot", async () => {
+test("V3: weak ETag does not lock HTTP source snapshot", async () => {
   let request = 0;
   const quote = String.fromCharCode(34);
-  const source = createHttpSource(
+  const source = httpSource(
     "test-source",
     async () => {
       request += 1;
@@ -499,10 +645,10 @@ test("V2: weak ETag does not lock HTTP source snapshot", async () => {
   assert.equal(request, 2);
 });
 
-test("V2: HTTP source captures and enforces numeric total size", async () => {
+test("V3: HTTP source captures and enforces numeric total size", async () => {
   let request = 0;
   let bodyReads = 0;
-  const source = createHttpSource(
+  const source = httpSource(
     "test-source",
     async () => {
       request += 1;
@@ -532,8 +678,8 @@ test("V2: HTTP source captures and enforces numeric total size", async () => {
   assert.equal(source.size, 10);
 });
 
-test("V2: hidden Content-Range leaves HTTP source size unknown", async () => {
-  const source = createHttpSource(
+test("V3: hidden Content-Range leaves HTTP source size unknown", async () => {
+  const source = httpSource(
     "test-source",
     async () => new Response(
       Uint8Array.from([7, 8]),
@@ -545,8 +691,8 @@ test("V2: hidden Content-Range leaves HTTP source size unknown", async () => {
   assert.equal(source.size, null);
 });
 
-test("V2: HTTP 200 fallback records complete source size", async () => {
-  const source = createHttpSource(
+test("V3: HTTP 200 fallback records complete source size", async () => {
+  const source = httpSource(
     "test-source",
     async () => new Response(
       Uint8Array.from([0, 1, 2, 3, 4, 5]),
@@ -559,103 +705,10 @@ test("V2: HTTP 200 fallback records complete source size", async () => {
   assert.equal(source.size, 6);
 });
 
-function httpArchiveSource(bytes, total) {
-  const indexLength = new DataView(
-    bytes.buffer,
-    bytes.byteOffset,
-    bytes.byteLength,
-  ).getUint32(8, true);
-  const payloadStart = 12 + indexLength;
-  let request = 0;
-
-  return createHttpSource(
-    "test-source",
-    async () => {
-      request += 1;
-      const start = request === 1 ? 0 : 12;
-      const end = request === 1 ? 12 : payloadStart;
-
-      return new Response(
-        bytes.slice(start, end),
-        {
-          status: 206,
-          headers: {
-            "Content-Range": `bytes ${start}-${end - 1}/${total}`,
-          },
-        },
-      );
-    },
-  );
-}
-
-test("V2: openCdeck accepts matching known source size", async () => {
-  const bytes = fixture("valid-one-record.cdeck");
-  const source = httpArchiveSource(bytes, bytes.byteLength);
-
-  const result = await openCdeck(source);
-
-  assert.equal(source.size, bytes.byteLength);
-  assert.equal(result.expectedFileLength, bytes.byteLength);
-  assert.equal(result.recordCount, 1);
-});
-
-test("V2: openCdeck rejects mismatched known source size", async () => {
-  const bytes = fixture("valid-one-record.cdeck");
-  const source = httpArchiveSource(
-    bytes,
-    bytes.byteLength + 1,
-  );
-
-  await assert.rejects(
-    openCdeck(source),
-    /file length mismatch/,
-  );
-});
-
-function lazyHarness() {
-  let instance;
-  let observerCount = 0;
-
-  class FakeObserver {
-    constructor(callback) {
-      this.callback = callback;
-      this.observed = new Set();
-      observerCount += 1;
-      instance = this;
-    }
-
-    observe(target) {
-      this.observed.add(target);
-    }
-
-    unobserve(target) {
-      this.observed.delete(target);
-    }
-
-    disconnect() {
-      this.observed.clear();
-    }
-
-    trigger(entries) {
-      return this.callback(entries);
-    }
-  }
-
-  return {
-    FakeObserver,
-    get instance() {
-      return instance;
-    },
-    get observerCount() {
-      return observerCount;
-    },
-  };
-}
-
-test("V2: HTTP source forwards optional abort signal", async () => {
+test("V3: HTTP source forwards optional abort signal", async () => {
   const controller = new AbortController();
   let seenSignal = null;
-  const source = createHttpSource(
+  const source = httpSource(
     "test-source",
     async (url, options) => {
       seenSignal = options.signal ?? null;
@@ -675,584 +728,171 @@ test("V2: HTTP source forwards optional abort signal", async () => {
   assert.equal(seenSignal, controller.signal);
 });
 
-test("V2: lazy failure reports once and callback can retry", async () => {
-  const harness = lazyHarness();
-  const target = {};
-  const record = {
-    jpegOffset: 10,
-    jpegLength: 1,
-  };
-  const errors = [];
-  let attempts = 0;
-  let retryPromise;
-  let loader;
 
-  loader = createLazyImageLoader(
-    {
-      async read() {
-        attempts += 1;
-        if (attempts === 1) {
-          throw new Error("broken read");
-        }
-        return Uint8Array.from([1]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:retry",
-      revokeObjectURL: () => {},
-      onError(error, errorTarget, errorRecord) {
-        errors.push([error, errorTarget, errorRecord]);
-        retryPromise = loader.retry(errorTarget);
-      },
-    },
-  );
-
-  loader.observe(target, record);
-
-  await harness.instance.trigger([
-    {
-      target,
-      isIntersecting: true,
-    },
-  ]).catch(() => {});
-
-  assert.equal(errors.length, 1);
-  assert.equal(errors[0][0].message, "broken read");
-  assert.equal(errors[0][1], target);
-  assert.equal(errors[0][2], record);
-
-  await retryPromise;
-
-  assert.equal(attempts, 2);
-  assert.equal(target.src, "blob:retry");
-});
-
-test("V2: retry never duplicates an in-flight load", async () => {
-  const harness = lazyHarness();
-  const target = {};
-  let reads = 0;
-  let resolveRead;
-
-  const loader = createLazyImageLoader(
-    {
-      read() {
-        reads += 1;
-        return new Promise((resolve) => {
-          resolveRead = resolve;
-        });
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:single",
-      revokeObjectURL: () => {},
-    },
-  );
-
-  loader.observe(
-    target,
-    {
-      jpegOffset: 20,
-      jpegLength: 1,
-    },
-  );
-
-  const pending = harness.instance.trigger([
-    {
-      target,
-      isIntersecting: true,
-    },
-  ]);
-
-  const retry = loader.retry(target);
-
-  assert.equal(reads, 1);
-
-  resolveRead(Uint8Array.from([1]));
-
-  await pending;
-  await retry;
-
-  assert.equal(reads, 1);
-  assert.equal(target.src, "blob:single");
-});
-
-test("V2: release aborts load and blocks late installation", async () => {
-  const harness = lazyHarness();
-  const target = {};
-  let seenSignal = null;
-  let resolveRead;
-
-  const loader = createLazyImageLoader(
-    {
-      read(start, length, signal) {
-        seenSignal = signal ?? null;
-        return new Promise((resolve) => {
-          resolveRead = resolve;
-        });
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:late",
-      revokeObjectURL: () => {},
-    },
-  );
-
-  loader.observe(
-    target,
-    {
-      jpegOffset: 30,
-      jpegLength: 1,
-    },
-  );
-
-  const pending = harness.instance.trigger([
-    {
-      target,
-      isIntersecting: true,
-    },
-  ]);
-
-  loader.release(target);
-  resolveRead(Uint8Array.from([1]));
-
-  await pending;
-
-  assert.ok(seenSignal);
-  assert.equal(seenSignal.aborted, true);
-  assert.equal(target.src, undefined);
-});
-
-test("V2: disconnect aborts active loads without onError", async () => {
-  const harness = lazyHarness();
-  const targets = [{}, {}];
-  const signals = [];
-  const errors = [];
-
-  const loader = createLazyImageLoader(
-    {
-      read(start, length, signal) {
-        signals.push(signal ?? null);
-        return new Promise((resolve, reject) => {
-          if (!signal) {
-            reject(new Error("missing abort signal"));
-            return;
-          }
-
-          signal.addEventListener(
-            "abort",
-            () => {
-              const error = new Error("aborted");
-              error.name = "AbortError";
-              reject(error);
-            },
-            { once: true },
-          );
-        });
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:unused",
-      revokeObjectURL: () => {},
-      onError: (error) => errors.push(error),
-    },
-  );
-
-  for (let index = 0; index < targets.length; index += 1) {
-    loader.observe(
-      targets[index],
-      {
-        jpegOffset: 40 + index,
-        jpegLength: 1,
-      },
-    );
-  }
-
-  const pending = harness.instance.trigger(
-    targets.map((target) => ({
-      target,
-      isIntersecting: true,
-    })),
-  ).catch((error) => error);
-
-  await Promise.resolve();
-  loader.disconnect();
-
-  const outcome = await pending;
-
-  assert.equal(outcome, undefined);
-  assert.equal(signals.length, 2);
-  assert.ok(signals.every((signal) => signal?.aborted));
-  assert.equal(errors.length, 0);
-});
-
-test("lazy loader does not fetch offscreen images", async () => {
-  const harness = lazyHarness();
-  let reads = 0;
-  const image = {};
-
-  const loader = createLazyImageLoader(
-    {
-      async read() {
-        reads += 1;
-        return Uint8Array.from([1, 2, 3]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:test",
-      revokeObjectURL: () => {},
-    },
-  );
-
-  loader.observe(
-    image,
-    {
-      jpegOffset: 100,
-      jpegLength: 3,
-    },
-  );
-
-  assert.equal(harness.observerCount, 1);
-  assert.equal(reads, 0);
-
-  await harness.instance.trigger([
-    {
-      target: image,
-      isIntersecting: false,
-    },
-  ]);
-
-  assert.equal(reads, 0);
-  assert.equal(image.src, undefined);
-});
-
-test("intersection fetches JPEG range once", async () => {
-  const harness = lazyHarness();
-  const reads = [];
-  const image = {};
-  let blob;
-
-  const loader = createLazyImageLoader(
-    {
-      async read(start, length) {
-        reads.push([start, length]);
-        return Uint8Array.from([9, 8, 7]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL(value) {
-        blob = value;
-        return "blob:image";
-      },
-      revokeObjectURL: () => {},
-    },
-  );
-
-  loader.observe(
-    image,
-    {
-      jpegOffset: 321,
-      jpegLength: 3,
-    },
-  );
-
-  const entry = {
-    target: image,
-    isIntersecting: true,
-  };
-
-  await Promise.all([
-    harness.instance.trigger([entry]),
-    harness.instance.trigger([entry]),
-  ]);
-
-  assert.deepEqual(
-    reads,
-    [[321, 3]],
-  );
-
-  assert.equal(image.src, "blob:image");
-  assert.equal(blob.type, "image/jpeg");
-  assert.equal(blob.size, 3);
-});
-
-test("lazy loader revokes Blob URL on release", async () => {
-  const harness = lazyHarness();
-  const image = {};
-  const revoked = [];
-
-  const loader = createLazyImageLoader(
-    {
-      async read() {
-        return Uint8Array.from([1]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:release",
-      revokeObjectURL: (url) => revoked.push(url),
-    },
-  );
-
-  loader.observe(
-    image,
-    {
-      jpegOffset: 12,
-      jpegLength: 1,
-    },
-  );
-
-  await harness.instance.trigger([
-    {
-      target: image,
-      isIntersecting: true,
-    },
-  ]);
-
-  loader.release(image);
-
-  assert.deepEqual(
-    revoked,
-    ["blob:release"],
+test("V3: parsed deck reads payload and keeps offsets private", async () => {
+  const records = [
+    { id: "data", length: 3, meta: { kind: "opaque" } },
+    { id: "empty", length: 0, meta: {} },
+  ];
+  const raw = encoder.encode(JSON.stringify(records));
+  const archive = new Uint8Array(12 + raw.length + 3);
+  archive.set(encoder.encode("CDECK002"), 0);
+  new DataView(archive.buffer).setUint32(8, raw.length, true);
+  archive.set(raw, 12);
+  archive.set([0, 255, 7], 12 + raw.length);
+  const deck = parseCdeckBuffer(archive);
+  assert.equal(deck.records[0].offset, undefined);
+  assert.deepEqual(Object.keys(deck.records[0]), ["id", "length", "meta"]);
+  assert.deepEqual([...await deck.read(deck.records[0])], [0, 255, 7]);
+  assert.deepEqual([...await deck.read(deck.records[1])], []);
+  await assert.rejects(
+    deck.read({ ...deck.records[0] }),
+    /record does not belong to deck/,
   );
 });
 
-test("lazy loader disconnect revokes all loaded URLs", async () => {
-  const harness = lazyHarness();
-  const revoked = [];
-  let number = 0;
-
-  const loader = createLazyImageLoader(
-    {
-      async read() {
-        return Uint8Array.from([1]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => `blob:${++number}`,
-      revokeObjectURL: (url) => revoked.push(url),
-    },
-  );
-
-  const first = {};
-  const second = {};
-
-  loader.observe(
-    first,
-    {
-      jpegOffset: 10,
-      jpegLength: 1,
-    },
-  );
-
-  loader.observe(
-    second,
-    {
-      jpegOffset: 11,
-      jpegLength: 1,
-    },
-  );
-
-  await harness.instance.trigger([
-    {
-      target: first,
-      isIntersecting: true,
-    },
-    {
-      target: second,
-      isIntersecting: true,
-    },
-  ]);
-
-  loader.disconnect();
-
-  assert.deepEqual(
-    revoked.sort(),
-    ["blob:1", "blob:2"],
-  );
-});
-
-
-test("openCdeck reads only header and index", async () => {
-  const bytes = fixture("valid-one-record.cdeck");
+test("V3: source deck reads exact payload range and forwards signal", async () => {
+  const records = [
+    { id: "data", length: 3, meta: {} },
+    { id: "empty", length: 0, meta: {} },
+  ];
+  const raw = encoder.encode(JSON.stringify(records));
+  const archive = new Uint8Array(12 + raw.length + 3);
+  archive.set(encoder.encode("CDECK002"), 0);
+  new DataView(archive.buffer).setUint32(8, raw.length, true);
+  archive.set(raw, 12);
+  archive.set([4, 5, 6], 12 + raw.length);
   const calls = [];
+  const source = {
+    size: archive.length,
+    async read(start, length, signal) {
+      calls.push({ start, length, signal });
+      return archive.slice(start, start + length);
+    },
+  };
+  const deck = await openCdeck(source);
+  const openedCalls = calls.length;
+  const signal = new AbortController().signal;
+  assert.deepEqual([...await deck.read(deck.records[0], signal)], [4, 5, 6]);
+  assert.equal(calls.length, openedCalls + 1);
+  assert.equal(calls.at(-1).start, deck.payloadStart);
+  assert.equal(calls.at(-1).length, 3);
+  assert.equal(calls.at(-1).signal, signal);
+  assert.deepEqual([...await deck.read(deck.records[1], signal)], []);
+  assert.equal(calls.length, openedCalls + 1);
+});
 
+test("V3: deck.read rejects short source payload", async () => {
+  const records = [{ id: "data", length: 3, meta: {} }];
+  const raw = encoder.encode(JSON.stringify(records));
+  const archive = new Uint8Array(12 + raw.length + 3);
+  archive.set(encoder.encode("CDECK002"), 0);
+  new DataView(archive.buffer).setUint32(8, raw.length, true);
+  archive.set(raw, 12);
+  const payloadStart = 12 + raw.length;
+  const source = {
+    size: archive.length,
+    async read(start, length) {
+      if (start === payloadStart) return new Uint8Array(2);
+      return archive.slice(start, start + length);
+    },
+  };
+  const deck = await openCdeck(source);
+  await assert.rejects(
+    deck.read(deck.records[0]),
+    /payload read length mismatch/,
+  );
+});
+
+test("V3: openCdeck accepts generic records", async () => {
+  const result = await openCdeck(
+    indexSource([
+      makeRecord({ length: 3 }),
+    ]),
+  );
+  assert.equal(result.recordCount, 1);
+  assert.equal(result.records[0].length, 3);
+  assert.equal(result.records[0].offset, undefined);
+  assert.deepEqual(
+    Object.keys(result.records[0]).sort(),
+    ["id", "length", "meta"],
+  );
+});
+
+test("V3: openCdeck enforces known source size", async () => {
+  const records = [makeRecord({ length: 3 })];
+  const raw = encoder.encode(JSON.stringify(records));
+  const expected = 12 + raw.byteLength + 3;
+  const accepted = await openCdeck(
+    indexSource(records, expected),
+  );
+  assert.equal(accepted.expectedFileLength, expected);
+  await assert.rejects(
+    openCdeck(indexSource(records, expected + 1)),
+    /file length mismatch/,
+  );
+});
+
+test("V3: record address arithmetic crosses 32-bit", async () => {
+  for (const length of [
+    (2 ** 32) - 1,
+    2 ** 32,
+    (2 ** 32) + 1,
+    8 * (2 ** 30),
+  ]) {
+    const result = await openCdeck(
+      indexSource([makeRecord({ length })]),
+    );
+    assert.equal(result.payloadBytes, length);
+  }
+});
+
+test("V3: cumulative safe-integer overflow is rejected", async () => {
+  await assert.rejects(
+    openCdeck(
+      indexSource([
+        makeRecord({
+          id: "first",
+          length: Number.MAX_SAFE_INTEGER,
+        }),
+        makeRecord({
+          id: "second",
+          length: 1,
+        }),
+      ]),
+    ),
+    /cumulative payload length exceeds safe integer limit/,
+  );
+});
+
+test("V3: openCdeck reads only header and index", async () => {
+  const records = [makeRecord({ length: 3 })];
+  const raw = encoder.encode(JSON.stringify(records));
+  const header = new Uint8Array(12);
+  header.set(encoder.encode("CDECK002"), 0);
+  new DataView(header.buffer).setUint32(8, raw.byteLength, true);
+  const calls = [];
   const result = await openCdeck({
     async read(start, length) {
       calls.push([start, length]);
-      return bytes.slice(start, start + length);
+      if (start === 0) return header.slice(0, length);
+      if (start === 12) return raw.slice(0, length);
+      throw new Error("payload must not be read");
     },
   });
-
   assert.deepEqual(
     calls,
-    [[0, 12], [12, 205]],
+    [[0, 12], [12, raw.byteLength]],
   );
-
   assert.equal(result.recordCount, 1);
-  assert.equal(result.payloadStart, 217);
-  assert.equal(result.records[0].jpegOffset, 217);
-  assert.equal(result.expectedFileLength, 11720);
 });
 
-test("lazy loader can observe card and fill image", async () => {
-  const harness = lazyHarness();
-  const card = {};
-  const image = {};
-  let intersections = 0;
-
-  const loader = createLazyImageLoader(
-    {
-      async read() {
-        return Uint8Array.from([1, 2]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => "blob:child",
-      revokeObjectURL: () => {},
-      onIntersect: () => {
-        intersections += 1;
-      },
-    },
-  );
-
-  loader.observe(
-    card,
-    {
-      jpegOffset: 10,
-      jpegLength: 2,
-    },
-    image,
-  );
-
-  await harness.instance.trigger([
-    {
-      target: card,
-      isIntersecting: true,
-    },
-  ]);
-
-  assert.equal(intersections, 1);
-  assert.equal(image.src, "blob:child");
-});
-
-
-function makeArchive(index, payload = new Uint8Array()) {
-  const encoded = new TextEncoder().encode(
-    JSON.stringify(index),
-  );
-
-  const bytes = new Uint8Array(
-    12 + encoded.byteLength + payload.byteLength,
-  );
-
-  bytes.set(
-    new TextEncoder().encode("CDECK001"),
-    0,
-  );
-
-  new DataView(bytes.buffer).setUint32(
-    8,
-    encoded.byteLength,
-    true,
-  );
-
-  bytes.set(encoded, 12);
-  bytes.set(payload, 12 + encoded.byteLength);
-
-  return bytes;
-}
-
-test("Phase 12: unknown JSON members are ignored", () => {
-  const archive = makeArchive(
-    {
-      futureTopLevel: "ignored",
-      decks: [
-        {
-          id: "deck_future",
-          name: "Future",
-          quantity: 1,
-          brand: "",
-          printer: "",
-          jpegLength: 1,
-          futureRecordMember: {
-            nested: true,
-          },
-        },
-      ],
-    },
-    Uint8Array.from([0xff]),
-  );
-
-  const result = parseCdeckBuffer(archive);
-
-  assert.equal(result.recordCount, 1);
-  assert.equal(
-    result.records[0].id,
-    "deck_future",
-  );
-  assert.equal(
-    result.records[0].futureRecordMember.nested,
-    true,
-  );
-});
-
-test("Phase 12: maximum-size index is accepted", () => {
-  const prefix = new TextEncoder().encode(
-    JSON.stringify({ decks: [] }),
-  );
-
-  const indexLength = 2_000_000;
-  const bytes = new Uint8Array(
-    12 + indexLength,
-  );
-
-  bytes.set(
-    new TextEncoder().encode("CDECK001"),
-    0,
-  );
-
-  new DataView(bytes.buffer).setUint32(
-    8,
-    indexLength,
-    true,
-  );
-
-  bytes.set(prefix, 12);
-  bytes.fill(
-    0x20,
-    12 + prefix.byteLength,
-  );
-
-  const result = parseCdeckBuffer(bytes);
-
-  assert.equal(
-    result.indexLength,
-    2_000_000,
-  );
-
-  assert.equal(result.recordCount, 0);
-  assert.equal(
-    result.expectedFileLength,
-    bytes.byteLength,
-  );
-});
-
-test("Phase 12: openCdeck rejects bad header before index read", async () => {
+test("V3: openCdeck rejects bad header before index read", async () => {
   const calls = [];
-
   await assert.rejects(
     openCdeck({
       async read(start, length) {
         calls.push([start, length]);
-
         return Uint8Array.from([
           0x42, 0x41, 0x44, 0x43,
           0x44, 0x45, 0x43, 0x4b,
@@ -1262,58 +902,167 @@ test("Phase 12: openCdeck rejects bad header before index read", async () => {
     }),
     /wrong magic/,
   );
+  assert.deepEqual(calls, [[0, 12]]);
+});
 
+const SHARED_VECTOR_ROOT = new URL("./vectors/", import.meta.url);
+const sharedVectors = JSON.parse(
+  readFileSync(
+    new URL("vectors.json", SHARED_VECTOR_ROOT),
+    "utf8",
+  ),
+);
+
+const escapePattern = (value) => (
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+);
+
+test("V3: shared CDECK002 vector corpus", () => {
+  assert.equal(sharedVectors.length, 21);
+
+  for (const vector of sharedVectors) {
+    const bytes = readFileSync(
+      new URL(vector.file, SHARED_VECTOR_ROOT),
+    );
+
+    if (!vector.valid) {
+      assert.throws(
+        () => parseCdeckBuffer(bytes),
+        new RegExp(escapePattern(vector.error)),
+        vector.file,
+      );
+      continue;
+    }
+
+    const deck = parseCdeckBuffer(bytes);
+    assert.equal(
+      deck.recordCount,
+      vector.recordCount,
+      vector.file,
+    );
+
+    if (!vector.expect) continue;
+
+    const record = deck.records[0];
+    assert.equal(record.id, vector.expect.id, vector.file);
+    assert.equal(record.length, vector.expect.length, vector.file);
+
+    if (vector.expect.meta) {
+      assert.deepEqual(
+        record.meta,
+        vector.expect.meta,
+        vector.file,
+      );
+    }
+
+    if (vector.expect.payloadSha256) {
+      const indexLength = bytes.readUInt32LE(8);
+      const payload = bytes.subarray(12 + indexLength);
+      const digest = createHash("sha256")
+        .update(payload)
+        .digest("hex");
+      assert.equal(
+        digest,
+        vector.expect.payloadSha256,
+        vector.file,
+      );
+    }
+  }
+});
+
+test("V3: HTTP 206 end-to-end open and payload reads stay range-addressed", async () => {
+  const records = [
+    { id: "asset", length: 3, meta: { kind: "binary" } },
+  ];
+  const raw = encoder.encode(JSON.stringify(records));
+  const archive = new Uint8Array(12 + raw.byteLength + 3);
+  archive.set(encoder.encode("CDECK002"), 0);
+  new DataView(archive.buffer).setUint32(8, raw.byteLength, true);
+  archive.set(raw, 12);
+  archive.set([7, 8, 9], 12 + raw.byteLength);
+
+  const calls = [];
+  const source = httpSource(
+    "test-source",
+    async (url, options) => {
+      const range = options.headers.Range;
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      assert.ok(match, range);
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      calls.push(range);
+      return new Response(
+        archive.slice(start, end + 1),
+        {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes ${start}-${end}/${archive.length}`,
+            ETag: "\"snapshot\"",
+          },
+        },
+      );
+    },
+  );
+
+  const deck = await openCdeck(source);
   assert.deepEqual(
     calls,
-    [[0, 12]],
+    [
+      "bytes=0-11",
+      `bytes=12-${11 + raw.byteLength}`,
+    ],
+  );
+
+  assert.deepEqual(
+    [...await deck.read(deck.records[0])],
+    [7, 8, 9],
+  );
+  assert.equal(calls.length, 3);
+  assert.equal(
+    calls[2],
+    `bytes=${deck.payloadStart}-${deck.payloadStart + 2}`,
   );
 });
 
-test("Phase 12: repeated observer notifications stay single-load", async () => {
-  const harness = lazyHarness();
-  const target = {};
-  let reads = 0;
-  let urls = 0;
+test("V3: HTTP 200 end-to-end fallback fetches whole representation once", async () => {
+  const records = [
+    { id: "asset", length: 3, meta: { kind: "binary" } },
+  ];
+  const raw = encoder.encode(JSON.stringify(records));
+  const archive = new Uint8Array(12 + raw.byteLength + 3);
+  archive.set(encoder.encode("CDECK002"), 0);
+  new DataView(archive.buffer).setUint32(8, raw.byteLength, true);
+  archive.set(raw, 12);
+  archive.set([4, 5, 6], 12 + raw.byteLength);
 
-  const loader = createLazyImageLoader(
-    {
-      async read() {
-        reads += 1;
-
-        return Uint8Array.from([
-          0xff,
-          0xd8,
-          0xff,
-        ]);
-      },
-    },
-    {
-      IntersectionObserver: harness.FakeObserver,
-      createObjectURL: () => {
-        urls += 1;
-        return "blob:repeat";
-      },
-      revokeObjectURL: () => {},
-    },
-  );
-
-  loader.observe(
-    target,
-    {
-      jpegOffset: 100,
-      jpegLength: 3,
+  const calls = [];
+  const source = httpSource(
+    "test-source",
+    async (url, options) => {
+      calls.push(options.headers.Range);
+      return new Response(
+        archive,
+        {
+          status: 200,
+          headers: {
+            "Content-Length": String(archive.length),
+            ETag: "\"snapshot\"",
+          },
+        },
+      );
     },
   );
 
-  const entry = {
-    target,
-    isIntersecting: true,
-  };
-
-  await harness.instance.trigger([entry]);
-  await harness.instance.trigger([entry]);
-  await harness.instance.trigger([entry]);
-
-  assert.equal(reads, 1);
-  assert.equal(urls, 1);
+  const deck = await openCdeck(source);
+  assert.deepEqual(calls, ["bytes=0-11"]);
+  assert.deepEqual(
+    [...await deck.read(deck.records[0])],
+    [4, 5, 6],
+  );
+  assert.deepEqual(
+    [...await deck.read(deck.records[0])],
+    [4, 5, 6],
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(source.size, archive.length);
 });

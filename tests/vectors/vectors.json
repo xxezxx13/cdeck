@@ -1,0 +1,130 @@
+[
+  {
+    "file": "valid-canonical.cdeck",
+    "valid": true,
+    "canonical": true,
+    "recordCount": 1,
+    "expect": {
+      "id": "asset-001",
+      "length": 3
+    }
+  },
+  {
+    "file": "valid-noncanonical.cdeck",
+    "valid": true,
+    "canonical": false,
+    "recordCount": 1
+  },
+  {
+    "file": "wrong-magic.cdeck",
+    "valid": false,
+    "error": "wrong magic"
+  },
+  {
+    "file": "unsupported-generation.cdeck",
+    "valid": false,
+    "error": "unsupported CDECK generation"
+  },
+  {
+    "file": "truncated-bootstrap.cdeck",
+    "valid": false,
+    "error": "header shorter than 12 bytes"
+  },
+  {
+    "file": "zero-index.cdeck",
+    "valid": false,
+    "error": "indexLength must be greater than zero"
+  },
+  {
+    "file": "oversized-index.cdeck",
+    "valid": false,
+    "error": "indexLength exceeds 16 MiB runtime limit"
+  },
+  {
+    "file": "malformed-utf8.cdeck",
+    "valid": false,
+    "error": "invalid UTF-8 index"
+  },
+  {
+    "file": "malformed-json.cdeck",
+    "valid": false,
+    "error": "invalid JSON index"
+  },
+  {
+    "file": "index-not-array.cdeck",
+    "valid": false,
+    "error": "index must be an array"
+  },
+  {
+    "file": "missing-core-member.cdeck",
+    "valid": false,
+    "error": "missing required member: meta"
+  },
+  {
+    "file": "extra-core-member.cdeck",
+    "valid": false,
+    "error": "unexpected member: extra"
+  },
+  {
+    "file": "duplicate-id.cdeck",
+    "valid": false,
+    "error": "duplicate id"
+  },
+  {
+    "file": "invalid-meta.cdeck",
+    "valid": false,
+    "error": "meta must be an object"
+  },
+  {
+    "file": "float-metadata.cdeck",
+    "valid": false,
+    "error": "JSON floats are not allowed"
+  },
+  {
+    "file": "unsafe-integer.cdeck",
+    "valid": false,
+    "error": "length"
+  },
+  {
+    "file": "zero-length.cdeck",
+    "valid": true,
+    "canonical": true,
+    "recordCount": 1,
+    "expect": {
+      "id": "empty",
+      "length": 0
+    }
+  },
+  {
+    "file": "cumulative-overflow.cdeck",
+    "valid": false,
+    "error": "cumulative payload length exceeds safe integer limit"
+  },
+  {
+    "file": "truncated-payload.cdeck",
+    "valid": false,
+    "error": "file length mismatch"
+  },
+  {
+    "file": "trailing-bytes.cdeck",
+    "valid": false,
+    "error": "file length mismatch"
+  },
+  {
+    "file": "migration-one-record.cdeck",
+    "valid": true,
+    "canonical": true,
+    "recordCount": 1,
+    "expect": {
+      "id": "deck_100_LM_Filters_USPCC",
+      "length": 11503,
+      "meta": {
+        "brand": "The United States Playing Card Company",
+        "name": "USPCC L&M Filters",
+        "printer": "The United States Playing Card Company",
+        "quantity": 1
+      },
+      "payloadSha256": "a78e4020fb12f763e91bdaa605ae610139f57e4132d6d29cc435240374707b5d"
+    }
+  }
+]
