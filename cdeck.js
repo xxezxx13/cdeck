@@ -148,6 +148,35 @@ function networkError(error) {
   const message = error instanceof Error ? error.message : error;
   return new CDeckError(`network failure: ${message}`);
 }
+async function readBoundedResponse(response, limit, message) {
+  if (!response.body?.getReader) {
+    return new Uint8Array(await response.arrayBuffer());
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) throw new CDeckError(message);
+      chunks.push(value);
+    }
+  } catch (error) {
+    try { await reader.cancel(); } catch { /* preserve original error */ }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
 export function createHttpSource(url, {
   maxFullBytes = DEFAULT_MAX_FULL_BYTES,
   fetch: fetchImpl = globalThis.fetch,
@@ -220,8 +249,15 @@ export function createHttpSource(url, {
         }
         let body;
         try {
-          body = new Uint8Array(await response.arrayBuffer());
+          const partial = response.status === 206;
+          body = await readBoundedResponse(
+            response,
+            partial ? length : maxFullBytes,
+            partial ? "partial response length mismatch: oversized body"
+              : "full response exceeds maxFullBytes",
+          );
         } catch (error) {
+          if (error instanceof CDeckError) throw error;
           throw networkError(error);
         }
         if (response.status === 206) {

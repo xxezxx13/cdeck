@@ -1066,3 +1066,118 @@ test("V3: HTTP 200 end-to-end fallback fetches whole representation once", async
   assert.equal(calls.length, 1);
   assert.equal(source.size, archive.length);
 });
+
+function v4TrackedBody() {
+  const state = { pulled: 0, cancelled: false };
+  const body = new ReadableStream({
+    pull(controller) {
+      if (state.pulled === 16) {
+        controller.close();
+        return;
+      }
+      state.pulled += 1;
+      controller.enqueue(Uint8Array.of(state.pulled));
+    },
+    cancel() { state.cancelled = true; },
+  }, { highWaterMark: 0 });
+  return { body, state };
+}
+
+test("V4: HTTP 200 streaming cap", async () => {
+  const { body, state } = v4TrackedBody();
+  const source = httpSource(
+    "test-source",
+    async () => new Response(body, { status: 200 }),
+    { maxFullBytes: 2 },
+  );
+  await assert.rejects(
+    source.read(0, 1),
+    /full response exceeds maxFullBytes/,
+  );
+  assert.ok(state.pulled < 16);
+  assert.equal(state.cancelled, true);
+});
+
+test("V4: HTTP 206 streaming cap", async () => {
+  const { body, state } = v4TrackedBody();
+  const source = httpSource(
+    "test-source",
+    async () => new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-1/16" },
+    }),
+  );
+  await assert.rejects(
+    source.read(0, 2),
+    /partial response length mismatch/,
+  );
+  assert.ok(state.pulled < 16);
+  assert.equal(state.cancelled, true);
+});
+
+test("V4: HTTP 200 stream accepts exact limit", async () => {
+  const { body, state } = v4TrackedBody();
+  let calls = 0;
+  const source = httpSource("test-source", async () => {
+    calls += 1;
+    return new Response(body, { status: 200 });
+  }, { maxFullBytes: 16 });
+  const bytes = await source.read(0, 16);
+  assert.deepEqual(Array.from(bytes), Array.from({ length: 16 }, (_, i) => i + 1));
+  assert.deepEqual(Array.from(await source.read(3, 2)), [4, 5]);
+  assert.equal(calls, 1);
+  assert.equal(state.cancelled, false);
+});
+
+test("V4: HTTP 206 stream accepts exact range", async () => {
+  const { body, state } = v4TrackedBody();
+  const source = httpSource("test-source", async () =>
+    new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-15/16" },
+    }));
+  const bytes = await source.read(0, 16);
+  assert.equal(bytes.byteLength, 16);
+  assert.deepEqual(Array.from(bytes.slice(0, 3)), [1, 2, 3]);
+  assert.equal(state.cancelled, false);
+});
+
+test("V4: HTTP 200 rejects understated streaming length", async () => {
+  const { body, state } = v4TrackedBody();
+  const source = httpSource("test-source", async () =>
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Length": "1" },
+    }), { maxFullBytes: 2 });
+  await assert.rejects(source.read(0, 1), /full response exceeds maxFullBytes/);
+  assert.ok(state.pulled < 16);
+  assert.equal(state.cancelled, true);
+});
+
+test("V4: streaming AbortError remains native", async () => {
+  const body = new ReadableStream({
+    pull(controller) {
+      controller.error(new DOMException("aborted", "AbortError"));
+    },
+  }, { highWaterMark: 0 });
+  const source = httpSource("test-source", async () =>
+    new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-0/1" },
+    }));
+  await assert.rejects(source.read(0, 1), error => error?.name === "AbortError");
+});
+
+test("V4: streaming read failure remains network error", async () => {
+  const body = new ReadableStream({
+    pull(controller) {
+      controller.error(new Error("stream failure"));
+    },
+  }, { highWaterMark: 0 });
+  const source = httpSource("test-source", async () =>
+    new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-0/1" },
+    }));
+  await assert.rejects(source.read(0, 1), /network failure: stream failure/);
+});
