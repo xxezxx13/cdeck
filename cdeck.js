@@ -419,3 +419,33 @@ export function parseCdeckBuffer(input) {
     (start, length) => bytes.slice(start, start + length),
   );
 }
+
+export function createBlobSource(blob) {
+  if (!blob || typeof blob.slice !== "function" ||
+      typeof blob.arrayBuffer !== "function" ||
+      !Number.isSafeInteger(blob.size) || blob.size < 0) {
+    throw new CDeckError("Blob or File required");
+  }
+  const size = blob.size;
+  return {
+    size,
+    async read(start, length, signal) {
+      if (length === 0) {
+        if (!Number.isSafeInteger(start) || start < 0 || start > size) {
+          throw new CDeckError("Blob read exceeds source size");
+        }
+        signal?.throwIfAborted();
+        return new Uint8Array();
+      }
+      const end = validateRead(start, length);
+      if (end > size) throw new CDeckError("Blob read exceeds source size");
+      signal?.throwIfAborted();
+      const bytes = new Uint8Array(await blob.slice(start, end).arrayBuffer());
+      signal?.throwIfAborted();
+      if (bytes.byteLength !== length) {
+        throw new CDeckError("Blob read length mismatch");
+      }
+      return bytes;
+    },
+  };
+}

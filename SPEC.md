@@ -382,6 +382,12 @@ A successful non-zero read returns exactly `length` bytes.
 
 The optional `signal` is used for cancellation by sources that support it.
 
+### Local Blob Source (reference adapter)
+
+`createBlobSource(blob)` implements this contract for browser `Blob` and `File` objects. It reports the local source size, uses `Blob.slice(start, start + length)`, and requires exact bytes for non-empty reads.
+
+As an adapter-specific convenience, it also supports zero-length reads at offsets from zero through `size` inclusive. This does not change the positive-length requirement for generic byte sources. Abort signals are checked before and after the asynchronous Blob read; an in-progress `Blob.arrayBuffer()` call cannot be interrupted.
+
 ## Browser Open Contract
 
 `openCdeck(source)` requires an object providing `read(start, length)`.

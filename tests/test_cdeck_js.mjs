@@ -1181,3 +1181,119 @@ test("V4: streaming read failure remains network error", async () => {
     }));
   await assert.rejects(source.read(0, 1), /network failure: stream failure/);
 });
+
+const createBlobSourceV4 = (await import("../cdeck.js")).createBlobSource;
+
+test("V4: Blob source reads exact slices", async () => {
+  const blob = new Blob([Uint8Array.of(1, 2, 3, 4, 5)]);
+  const original = blob.slice.bind(blob);
+  const ranges = [];
+  blob.slice = (start, end) => {
+    ranges.push([start, end]);
+    return original(start, end);
+  };
+  blob.arrayBuffer = () => { throw new Error("whole Blob read"); };
+  const source = createBlobSourceV4(blob);
+  assert.equal(source.size, 5);
+  assert.deepEqual(Array.from(await source.read(1, 3)), [2, 3, 4]);
+  assert.deepEqual(ranges, [[1, 4]]);
+});
+
+test("V4: Blob source opens complete archive selectively", async () => {
+  const archive = makeArchive([makeRecord({ length: 3 })], Uint8Array.of(7, 8, 9));
+  const blob = new Blob([archive]);
+  const original = blob.slice.bind(blob);
+  const ranges = [];
+  blob.slice = (start, end) => {
+    ranges.push([start, end]);
+    return original(start, end);
+  };
+  blob.arrayBuffer = () => { throw new Error("whole archive read"); };
+  const deck = await openCdeck(createBlobSourceV4(blob));
+  assert.equal(deck.recordCount, 1);
+  assert.deepEqual(Array.from(await deck.read(deck.records[0])), [7, 8, 9]);
+  assert.equal(ranges.length, 3);
+  assert.deepEqual(ranges[0], [0, 12]);
+  assert.equal(ranges[1][0], 12);
+  assert.equal(ranges[2][1] - ranges[2][0], 3);
+});
+
+test("V4: Blob source validates ranges and empty reads", async () => {
+  const source = createBlobSourceV4(new Blob([Uint8Array.of(1, 2, 3)]));
+  await assert.rejects(source.read(-1, 1), CDeckError);
+  await assert.rejects(source.read(1.5, 1), CDeckError);
+  await assert.rejects(source.read(1, 3), CDeckError);
+  await assert.rejects(source.read(Number.MAX_SAFE_INTEGER, 1), CDeckError);
+  assert.equal((await source.read(3, 0)).byteLength, 0);
+});
+
+test("V4: Blob source rejects invalid input", () => {
+  assert.throws(() => createBlobSourceV4(null), CDeckError);
+  assert.throws(() => createBlobSourceV4({}), CDeckError);
+});
+
+test("V4: Blob source rejects pre-aborted read", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const source = createBlobSourceV4(new Blob([Uint8Array.of(1)]));
+  await assert.rejects(
+    source.read(0, 1, controller.signal),
+    error => error?.name === "AbortError",
+  );
+});
+
+test("V4: Blob source detects abort after asynchronous read", async () => {
+  const controller = new AbortController();
+  const blob = new Blob([Uint8Array.of(1, 2)]);
+  const original = blob.slice.bind(blob);
+  blob.slice = (start, end) => {
+    const part = original(start, end);
+    const read = part.arrayBuffer.bind(part);
+    part.arrayBuffer = async () => {
+      const bytes = await read();
+      controller.abort();
+      return bytes;
+    };
+    return part;
+  };
+  const source = createBlobSourceV4(blob);
+  await assert.rejects(
+    source.read(0, 1, controller.signal),
+    error => error?.name === "AbortError",
+  );
+});
+
+test("V4: Blob source handles zero-length boundaries", async () => {
+  const source = createBlobSourceV4(new Blob([Uint8Array.of(1, 2)]));
+  assert.equal((await source.read(0, 0)).byteLength, 0);
+  assert.equal((await source.read(2, 0)).byteLength, 0);
+  await assert.rejects(source.read(3, 0), CDeckError);
+  await assert.rejects(source.read(-1, 0), CDeckError);
+  await assert.rejects(source.read(0, -1), CDeckError);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    source.read(0, 0, controller.signal),
+    error => error?.name === "AbortError",
+  );
+});
+
+test("V4: Blob source rejects short sliced payload", async () => {
+  const malformed = {
+    size: 4,
+    slice() { return new Blob([Uint8Array.of(1)]); },
+    async arrayBuffer() { return new ArrayBuffer(4); },
+  };
+  const source = createBlobSourceV4(malformed);
+  await assert.rejects(
+    source.read(0, 3),
+    /Blob read length mismatch/,
+  );
+});
+
+test("V4: Blob source supports native File objects", async () => {
+  const file = new File([Uint8Array.of(10, 20, 30)], "example.cdeck");
+  const source = createBlobSourceV4(file);
+  assert.equal(source.size, 3);
+  assert.deepEqual(Array.from(await source.read(1, 2)), [20, 30]);
+});

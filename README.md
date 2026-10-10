@@ -176,6 +176,7 @@ The public JavaScript surface is intentionally small:
 ```javascript
 CDeckError
 createHttpSource(url, options)
+createBlobSource(blob)
 openCdeck(source)
 parseCdeckBuffer(buffer)
 ```
@@ -202,6 +203,19 @@ Physical offsets remain private implementation details.
 `deck.read(record, signal)` retrieves exactly that record payload. A zero-length record returns an empty byte array without issuing a source read.
 
 `parseCdeckBuffer()` provides the same deck/read model for an already-buffered local representation.
+
+## Local Blob/File Access
+
+`createBlobSource(blob)` accepts a browser `Blob` or `File`, exposes its size, and uses `Blob.slice()` to read only requested byte ranges.
+
+```javascript
+import { createBlobSource, openCdeck } from "./cdeck.js";
+
+const deck = await openCdeck(createBlobSource(file));
+const bytes = await deck.read(deck.records[0]);
+```
+
+`file` is supplied by the application; CDECK does not provide a file picker. The adapter supports zero-length reads within the Blob bounds. Its optional `AbortSignal` is checked before and after `Blob.arrayBuffer()`, but cannot interrupt that operation. Unlike this selective-access path, `parseCdeckBuffer()` accepts a complete archive already in memory.
 
 ## HTTP Range Requests
 
