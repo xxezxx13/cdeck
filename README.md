@@ -21,6 +21,14 @@ The browser can read the small header and index first, derive the byte location 
 
 CDECK is not trying to be a database, archive suite, media framework, or package ecosystem. It is intentionally small.
 
+## What Changed in V4
+
+V4 preserves the CDECK002 wire format and existing V3 APIs while adding:
+
+- Bounded streaming of HTTP 206 and HTTP 200 response bodies.
+- Native Blob/File selective access through `createBlobSource(blob)`.
+- Reproducible synthetic performance benchmarks for the supported access strategies.
+
 ## Why I Built It
 
 The original Cardeckatcher deployment looked roughly like this:
@@ -47,9 +55,9 @@ The current wire format is:
 CDECK002
 ```
 
-CDECK software uses whole-number releases such as `v1`, `v2`, and `v3`. Software release numbers and file-format generations are separate.
+CDECK software uses whole-number releases such as `v1`, `v2`, `v3`, and `v4`. Software release numbers and file-format generations are separate.
 
-CDECK V3 reads and writes `CDECK002`.
+CDECK V3 and V4 read and write `CDECK002`.
 
 `CDECK001` is the previous generation. V3 intentionally does not keep permanent CDECK001 parsing inside the browser/runtime core. A standalone migration tool is provided instead.
 
@@ -381,6 +389,20 @@ tests/vectors/
 
 Production code is kept under a hard 1,000-line ceiling across `cdeck.py` and `cdeck.js`.
 
+## Performance Benchmarks
+
+Run the standalone benchmark using Node.js 24:
+
+```bash
+node tools/bench_cdeck.mjs
+```
+
+The benchmark covers 251-record and 500-record synthetic archives using native Blob access, simulated HTTP 206 responses, simulated HTTP 200 fallback, and fully buffered parsing.
+
+Each profile uses two warmup iterations followed by five measured iterations. Reported timings are medians.
+
+The HTTP scenarios do not include real network latency. The Blob scenarios use in-memory data rather than physical disk I/O. Timings are diagnostic measurements, not performance guarantees or CI performance thresholds.
+
 ## Requirements
 
 The Python implementation uses only the standard library.
@@ -404,7 +426,7 @@ The wire format has its own generation identifier.
 
 `v1` and `v2` used CDECK001.
 
-`v3` uses CDECK002.
+`v3` and `v4` use CDECK002.
 
 A future software release does not require a new wire generation unless the actual format contract changes.
 

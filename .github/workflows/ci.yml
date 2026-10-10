@@ -31,6 +31,9 @@ jobs:
       - name: JavaScript tests
         run: node --test tests/test_cdeck_js.mjs
 
+      - name: Benchmark smoke test
+        run: node tools/bench_cdeck.mjs
+
       - name: Diff integrity
         run: git diff --check
 

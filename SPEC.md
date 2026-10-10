@@ -12,7 +12,7 @@ CDECK002
 
 CDECK software release numbering is independent from file-format generation.
 
-CDECK V3 reads and writes CDECK002.
+CDECK V3 and V4 read and write CDECK002.
 
 CDECK001 is the previous generation and is intentionally not part of the permanent V3 runtime reader. Migration is handled by the standalone `tools/cdeck001_to_002.py` utility.
 
